@@ -151,6 +151,10 @@ pub struct EmittedEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
     #[serde(default)]
     pub event: Option<String>,
     #[serde(default)]

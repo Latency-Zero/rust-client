@@ -257,6 +257,7 @@ async fn authentication_errors_are_typed() {
 async fn incoming_event_and_process_calls_return_results() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (finished, received) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut reader, mut writer) = accept_handshake(
             listener,
@@ -312,6 +313,7 @@ async fn incoming_event_and_process_calls_return_results() {
                 break;
             }
         }
+        finished.send(()).unwrap();
 
         let leave = read_message(&mut reader).await;
         assert_eq!(leave.kind, "leave_pool");
@@ -346,7 +348,10 @@ async fn incoming_event_and_process_calls_return_results() {
         )
         .await
         .unwrap();
-    time::sleep(Duration::from_millis(100)).await;
+    time::timeout(Duration::from_secs(1), received)
+        .await
+        .expect("handler replies were not received")
+        .unwrap();
     client.disconnect().await.unwrap();
     server.await.unwrap();
 }

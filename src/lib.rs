@@ -5,6 +5,8 @@
 //! process-local shared-memory mode is Python-specific and is not part of the
 //! cross-language wire protocol.
 
+#![doc = include_str!("../README.md")]
+
 mod client;
 mod error;
 pub mod protocol;

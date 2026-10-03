@@ -16,6 +16,12 @@ pub enum Error {
     #[error("client is disconnected")]
     Disconnected,
 
+    #[error("client admission limit exceeded: {resource}")]
+    Overloaded { resource: &'static str },
+
+    #[error("frame has {size} bytes, exceeding the configured {limit}-byte limit")]
+    FrameTooLarge { size: usize, limit: usize },
+
     #[error("timed out after {timeout:?} waiting for request {request_id}")]
     Timeout {
         request_id: String,
@@ -27,6 +33,14 @@ pub enum Error {
 
     #[error("server error {code}: {message}")]
     Server { code: String, message: String },
+
+    #[error("partial delivery: {message}")]
+    PartialDelivery {
+        message: String,
+        accepted: Vec<String>,
+        failed: Vec<String>,
+        request_ids: Vec<String>,
+    },
 
     #[error("protocol error: {0}")]
     Protocol(String),

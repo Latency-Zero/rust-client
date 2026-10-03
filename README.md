@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/latzero.svg)](https://crates.io/crates/latzero)
 [![Documentation](https://docs.rs/latzero/badge.svg)](https://docs.rs/latzero)
-[![License](https://img.shields.io/crates/l/latzero.svg)](LICENSE)
+[![License](https://img.shields.io/crates/l/latzero.svg)](https://github.com/LatZero/rust-client/blob/main/LICENSE)
 
 `latzero` is the asynchronous Rust client for `latzero-server`. It provides
 JSON buffers, subscriptions, events, RPC, and registered worker processes over
@@ -193,7 +193,9 @@ Additional buffer helpers include:
 | Client-side batches | `mset`, `mget` |
 | Subscriptions | `subscribe_buffer`, `unsubscribe_buffer` |
 
-Batch helpers currently issue one protocol request per key.
+Batch helpers issue one protocol request per key and reject batches larger than
+`max_batch_size` before issuing the first request. They are not atomic; an error
+partway through an admitted batch does not roll back earlier operations.
 
 ## Namespaced Buffers
 
@@ -223,7 +225,7 @@ are not atomic across multiple clients.
 
 ## Buffer Subscriptions
 
-Create an event receiver before subscribing so no update is missed:
+Create an event receiver before subscribing so early updates can be observed:
 
 ```rust,no_run
 use latzero::{Client, ClientEvent};
@@ -249,7 +251,12 @@ client.unsubscribe_buffer("jobs:status").await?;
 ```
 
 `Client::events()` returns a Tokio broadcast receiver. Each receiver observes
-its own stream, and slow receivers can report Tokio broadcast lag errors.
+its own bounded stream. A slow receiver receives `RecvError::Lagged(n)` when
+retained events are overwritten; handle that explicit signal and re-read state
+when necessary. This local event stream is not a durable replay log. The
+registered handler path has separate admission limits; excess RPC work returns
+a safe application error, while excess notification handler work disconnects
+rather than silently claiming that a callback ran.
 
 ## Events
 
@@ -272,6 +279,23 @@ let handler_id = client
 
 // Remove it later if it is no longer needed.
 client.remove_event_handler("notifications:show", handler_id).await;
+# }
+```
+
+`try_on_event` accepts the same callback and returns `Result<EventHandlerId>`
+for explicit registration-limit or validation errors. The existing infallible
+`on_event` API is preserved; if local registration cannot be admitted it emits
+`HandlerFailed` and fails the connection instead of pretending installation
+succeeded. Event handlers are asynchronous Tokio tasks, not OS worker threads.
+
+```rust,no_run
+# use latzero::Client;
+# async fn bounded_handler(client: &Client) -> latzero::Result<()> {
+let id = client
+    .try_on_event("status:read", |_| async { Ok::<_, String>("ready") })
+    .await?;
+client.remove_event_handler("status:read", id).await;
+# Ok(())
 # }
 ```
 
@@ -331,6 +355,11 @@ async fn main() -> latzero::Result<()> {
 client. When a different response client is selected, it returns
 `CallOutcome::Routed { request_id }` after server acknowledgement instead of
 waiting locally. The response client receives `ClientEvent::AppResult`.
+The event's request ID is the original caller correlation, and `AppResult`
+includes optional `request_id` and `parent_request_id` metadata. Missing fields
+from older servers remain supported. Direct and explicit self-response calls
+return their terminal result in either ACK/result arrival order; acceptance
+does not imply execution or remote observation.
 
 ## Namespaced Events
 
@@ -491,9 +520,12 @@ distinguishes:
 | `InvalidDsn` | The DSN is not a valid `latzero://client-id` value |
 | `Connection` | The TCP connection could not be opened |
 | `Disconnected` | An operation used a closed client |
+| `Overloaded` | A local request, queue, handler, registration, or batch limit rejected admission |
+| `FrameTooLarge` | An encoded request exceeds the configured application-frame limit |
 | `Timeout` | A correlated request did not finish in time |
 | `Authentication` | Pool authentication failed |
 | `Server` | The server rejected a request |
+| `PartialDelivery` | Fanout accepted only some destinations; includes accepted/failed destinations and child IDs |
 | `Protocol` | Local or remote protocol requirements were violated |
 | `Serialization` | JSON encoding or decoding failed |
 | `Io` | The socket or frame writer failed |
@@ -536,6 +568,75 @@ reconnection, or resumable sessions. A closed connection fails pending
 requests. Create a new `Client` and re-register event handlers and processes to
 reconnect.
 
+Incoming call IDs are opaque per-hop IDs and are echoed unchanged. The client
+does not require workers or old servers to include new reply fields. Wire TTLs
+and timeouts are fractional seconds derived from `Duration`; Rust does not use
+the JavaScript millisecond API convention. Malformed JSON, non-object payloads,
+oversized frames, unframed/partial EOF, failed writes, and write deadlines fail
+the connection and settle pending requests. A valid definitive reply immediately
+before EOF still wins over disconnect.
+
+## Bounded Lifetimes
+
+These builder settings are protective limits, not throughput guarantees:
+
+| Builder Setting | Default |
+| --- | --- |
+| `timeout` | 5 seconds |
+| `write_timeout` / `shutdown_timeout` | 5 / 1 seconds |
+| `max_pending_requests` / `writer_capacity` | 256 / 256 |
+| `max_frame_bytes` / `max_queued_bytes` | 1 MiB / 1 MiB |
+| `control_reserve` / `control_reserve_bytes` | 32 messages / 64 KiB |
+| `max_handler_tasks` / `max_handler_bytes` | 256 / 1 MiB |
+| `max_batch_size` | 256 |
+| `event_capacity` | 256 |
+
+```rust,no_run
+use latzero::Client;
+use std::time::Duration;
+
+# async fn limits() -> latzero::Result<()> {
+let client = Client::builder("latzero://bounded-worker", "app")
+    .max_pending_requests(64)
+    .writer_capacity(64)
+    .max_queued_bytes(512 * 1024)
+    .max_handler_tasks(32)
+    .write_timeout(Duration::from_secs(2))
+    .connect()
+    .await?;
+client.disconnect().await
+# }
+```
+
+Regular admission is nonblocking. Handler replies share the ordered writer with
+reserved control capacity; they cannot be starved solely by regular requests.
+Byte limits include queued/in-flight encoded output, and handler-input estimates
+include encoded input plus metadata. They do not bound temporary serialization
+allocations, decoded-object overhead, or memory allocated by user code. Pending
+reply slots admit at most one acceptance ACK and one terminal response.
+
+One deadline covers TCP connect, hello, and join. Requests use one deadline for
+local admission, sending, and terminal completion; pool transitions reject new
+regular work explicitly. An expired or cancelled request still queued before
+transmission is skipped, not replayed. Once a write starts, timeout/cancellation
+cannot guarantee that remote handler effects did not occur.
+
+Handlers and transport tasks are tracked. Disconnect, EOF, last-public-handle
+drop, and changed-pool switches cancel admitted async work and fence late replies
+to its original pool/session generation. Same-pool rejoin retains handlers and
+registrations. Process replacement prepares the new handler before advertising
+it, restores the prior handler on a definitive server rejection, and quiesces
+old work on replacement/unregister. Ambiguous registration or membership
+outcomes fail the connection rather than guessing which server state committed.
+Queue metrics count actual waiting work; cancelled work is not a completion.
+
+Panics that unwind and result-serialization failures become JSON-safe handler
+errors; oversized results become a small error when it fits the configured
+frame. Panic-abort builds and CPU-blocking user functions cannot be recovered or
+preempted by Tokio. Callback cancellation cannot undo effects or cancel detached
+tasks created by user handlers. No automatic reconnect or effectful replay was
+added.
+
 ## Security Notes
 
 - Pool authentication controls admission but does not encrypt traffic.
@@ -569,12 +670,34 @@ Either side can be started first.
 
 ```console
 cargo fmt --all -- --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --locked
+cargo test --doc --locked
+cargo clippy --all-targets --locked -- -D warnings
 cargo doc --no-deps
 cargo package
 ```
 
+Raw TCP regression tests use ephemeral ports, barriers, and finite waits. The
+actual-daemon suite requires the sibling `latzero-server` checkout and an
+explicit Python interpreter with its dependencies installed:
+
+```powershell
+$env:LATZERO_TEST_PYTHON = "C:\path\to\venv\Scripts\python.exe"
+cargo test --all-targets --locked
+cargo +1.85.0 test --all-targets --locked
+```
+
+The fixture starts an isolated TCP daemon on port `0` with temporary snapshots
+and controlled cleanup. It validates Rust/raw/Python/Node calls, results, buffers,
+TTL, and pool transitions. Missing prerequisites emit explicit skip reasons;
+enable `LATZERO_TEST_PYTHON` when claiming real-daemon verification. The Rust
+Node case requires the sibling `node-client` checkout and `node` on PATH, or an
+explicit `LATZERO_TEST_NODE` executable. Node child processes are owned, deadline
+bounded and reaped separately from the daemon fixture.
+The Rust 1.85 minimum is unchanged and tested with the locked dependency set.
+Browser-engine, other-OS, and long-running load verification remain separate
+gates, not passing results implied by these tests.
+
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE).
+Licensed under the MIT License. See [LICENSE](https://github.com/LatZero/rust-client/blob/main/LICENSE).
