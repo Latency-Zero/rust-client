@@ -168,7 +168,7 @@ original connect or switch deadline; a hop does not restart the timeout.
 16**, counted separately for each connect or explicit switch. Zero rejects
 redirects rather than following them. Revisited endpoints, malformed protocol,
 client/pool mismatches, nonzero-u16 port violations, and invalid pod index/count
-are `Error::Protocol`. A chain's cluster and pod count must remain consistent;
+are `Error::Protocol`. A chain's cluster, pod count, and router must remain consistent;
 these are ownership metadata, not authentication. The final owner still checks
 the pool token, and denial remains `Error::Authentication`.
 
@@ -666,16 +666,16 @@ include encoded input plus metadata. They do not bound temporary serialization
 allocations, decoded-object overhead, or memory allocated by user code. Pending
 reply slots admit at most one acceptance ACK and one terminal response.
 
-One deadline covers TCP connect, hello, join, and all redirect hops. Requests use one deadline for
-local admission, sending, and terminal completion; pool transitions reject new
+One deadline covers TCP connect, hello, join, and all redirect hops. Requests
+use one deadline for local admission, sending, and terminal completion; pool transitions reject new
 regular work explicitly. An expired or cancelled request still queued before
 transmission is skipped, not replayed. Once a write starts, timeout/cancellation
 cannot guarantee that remote handler effects did not occur.
 
 Handlers and transport tasks are tracked. Disconnect, EOF, last-public-handle
 drop, and changed-pool switches cancel admitted async work and fence late replies
-to its original pool/session generation. Same-owner, same-pool rejoin retains handlers and
-registrations. Process replacement prepares the new handler before advertising
+to its original pool/session generation. Same-owner, same-pool rejoin retains
+handlers and registrations. Process replacement prepares the new handler before advertising
 it, restores the prior handler on a definitive server rejection, and quiesces
 old work on replacement/unregister. Ambiguous registration or membership
 outcomes fail the connection rather than guessing which server state committed.

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     future::{Future, poll_fn},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
@@ -605,7 +605,7 @@ struct RedirectChain {
     limit: usize,
     redirects: usize,
     visited: HashSet<SocketAddr>,
-    ownership: Option<(String, u64)>,
+    ownership: Option<(String, u64, IpAddr, u16, Option<u16>)>,
 }
 
 impl RedirectChain {
@@ -643,9 +643,9 @@ impl RedirectChain {
             .ok_or_else(|| invalid("target must be a numeric loopback address"))?;
         let port = redirect_port(&message.payload, "port", false)?.unwrap();
         redirect_port(&message.payload, "ws_port", true)?;
-        redirect_port(&message.payload, "router_port", false)?;
-        redirect_port(&message.payload, "router_ws_port", true)?;
-        message.payload["router_host"]
+        let router_port = redirect_port(&message.payload, "router_port", false)?.unwrap();
+        let router_ws_port = redirect_port(&message.payload, "router_ws_port", true)?;
+        let router_host = message.payload["router_host"]
             .as_str()
             .and_then(|host| host.parse::<IpAddr>().ok())
             .filter(IpAddr::is_loopback)
@@ -667,10 +667,16 @@ impl RedirectChain {
         if self
             .ownership
             .as_ref()
-            .is_some_and(|(known, pods)| known != cluster || *pods != count)
+            .is_some_and(|(known, pods, host, port, ws_port)| {
+                known != cluster
+                    || *pods != count
+                    || *host != router_host
+                    || *port != router_port
+                    || *ws_port != router_ws_port
+            })
         {
             return Err(invalid(
-                "cluster or pod count changed within redirect chain",
+                "cluster, pod count, or router changed within redirect chain",
             ));
         }
         if self.redirects >= self.limit {
@@ -680,7 +686,13 @@ impl RedirectChain {
         if !self.visited.insert(endpoint) {
             return Err(invalid("endpoint cycle"));
         }
-        self.ownership = Some((cluster.to_owned(), count));
+        self.ownership = Some((
+            cluster.to_owned(),
+            count,
+            router_host,
+            router_port,
+            router_ws_port,
+        ));
         self.redirects += 1;
         Ok(Endpoint {
             host: ip.to_string(),
@@ -723,8 +735,8 @@ async fn open_pool_connection(
             if endpoint.host.eq_ignore_ascii_case("localhost") {
                 // Race the two numeric local addresses: a stalled IPv6 connect
                 // must not consume the whole deadline before IPv4 is attempted.
-                let ipv4 = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, endpoint.port));
-                let ipv6 = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, endpoint.port));
+                let ipv4 = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port));
+                let ipv6 = TcpStream::connect((Ipv6Addr::LOCALHOST, endpoint.port));
                 tokio::pin!(ipv4, ipv6);
                 tokio::select! {
                     result = &mut ipv4 => match result {
@@ -759,7 +771,18 @@ async fn open_pool_connection(
             }
         };
         let peer_addr = stream.peer_addr()?;
-        chain.visited.insert(peer_addr);
+        if endpoint.host.eq_ignore_ascii_case("localhost") {
+            chain.visited.insert(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                endpoint.port,
+            ));
+            chain.visited.insert(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                endpoint.port,
+            ));
+        } else {
+            chain.visited.insert(peer_addr);
+        }
         let _ = stream.set_nodelay(true);
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -921,7 +944,8 @@ impl Client {
                     "auth_token": auth_token,
                 }),
                 Some(pool.clone()),
-                deadline.saturating_duration_since(Instant::now()),
+                deadline,
+                timeout,
             )
             .await;
         let redirected = result
@@ -989,7 +1013,8 @@ impl Client {
                         MessageType::LeavePool,
                         json!({}),
                         Some(self.pool_name().await),
-                        deadline.saturating_duration_since(Instant::now()),
+                        deadline,
+                        timeout,
                     )
                     .await
                     .map(|_| ()),
@@ -1585,7 +1610,8 @@ impl Client {
                 MessageType::RegisterProcess,
                 payload,
                 Some(self.pool_name().await),
-                deadline.saturating_duration_since(Instant::now()),
+                deadline,
+                self.inner.timeout,
             )
             .await
         {
@@ -1642,7 +1668,8 @@ impl Client {
                 MessageType::UnregisterProcess,
                 json!({ "process_name": name }),
                 Some(self.pool_name().await),
-                deadline.saturating_duration_since(Instant::now()),
+                deadline,
+                self.inner.timeout,
             )
             .await;
         match result {
@@ -1889,10 +1916,10 @@ impl Client {
         kind: MessageType,
         payload: Value,
         pool: Option<String>,
+        deadline: Instant,
         timeout: Duration,
     ) -> Result<Message> {
         let request_id = Uuid::new_v4().to_string();
-        let deadline = deadline(timeout)?;
         let mut pending = self
             .open_request(
                 Message::new(
@@ -2645,7 +2672,8 @@ async fn metrics_loop(inner: Weak<Inner>) {
                     MessageType::WorkerMetrics,
                     json!({"metrics": metrics}),
                     Some(pool),
-                    deadline.saturating_duration_since(Instant::now()),
+                    deadline,
+                    client.inner.timeout,
                 )
                 .await;
         }

@@ -497,7 +497,13 @@ async fn localhost_alias_and_two_endpoint_cycles_are_rejected_without_reconnect(
 
 #[tokio::test]
 async fn ownership_metadata_changes_within_chain_are_not_authentication() {
-    for (field, value) in [("cluster_id", json!("another")), ("pod_count", json!(3))] {
+    for (field, value) in [
+        ("cluster_id", json!("another")),
+        ("pod_count", json!(3)),
+        ("router_host", json!("127.0.0.2")),
+        ("router_port", json!(12346)),
+        ("router_ws_port", json!(12347)),
+    ] {
         let first = listener().await;
         let second = listener().await;
         let target = listener().await;
