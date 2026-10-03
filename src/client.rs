@@ -300,6 +300,7 @@ impl ClientBuilder {
             timeout: self.timeout,
             write_timeout: self.write_timeout,
             max_frame_bytes: self.max_frame_bytes,
+            max_queued_bytes: self.max_queued_bytes,
         };
         let connection = open_pool_connection(
             entry_endpoint.clone(),
@@ -594,6 +595,7 @@ struct HandshakeOptions {
     timeout: Duration,
     write_timeout: Duration,
     max_frame_bytes: usize,
+    max_queued_bytes: usize,
 }
 
 struct RedirectChain {
@@ -787,6 +789,9 @@ async fn handshake_request(
         return Err(Error::FrameTooLarge { size: encoded.len(), limit: options.max_frame_bytes });
     }
     encoded.push(b'\n');
+    if encoded.len() > options.max_queued_bytes {
+        return Err(Error::Overloaded { resource: "writer bytes" });
+    }
     let write_deadline = options.deadline.min(deadline(options.write_timeout)?);
     time::timeout_at(write_deadline.into(), writer.write_all(&encoded))
         .await
@@ -875,9 +880,7 @@ impl Client {
             self.inner.switching.store(true, Ordering::Release);
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
             lock(&self.inner.pending).clear();
-            time::timeout_at(deadline.into(), self.cancel_handlers())
-                .await
-                .map_err(|_| request_timeout("switch_pool", timeout))?;
+            self.cancel_handlers(deadline).await?;
         }
         let mut result = self
             .request_in_pool(
@@ -900,15 +903,14 @@ impl Client {
                 timeout,
                 write_timeout: self.inner.write_timeout,
                 max_frame_bytes: self.inner.max_frame_bytes,
+                max_queued_bytes: self.inner.max_queued_bytes,
             };
             let mut chain =
                 RedirectChain::new(&self.inner.entry_endpoint.host, self.inner.max_redirects);
             chain.visited.insert(peer_addr);
             result = async {
                 let endpoint = chain.follow(result.as_ref().unwrap(), self.client_id(), &pool)?;
-                time::timeout_at(deadline.into(), self.cancel_handlers())
-                    .await
-                    .map_err(|_| request_timeout("pool redirect handoff", timeout))?;
+                self.cancel_handlers(deadline).await?;
                 self.stop_transport(deadline).await?;
                 let connection = open_pool_connection(
                     endpoint,
@@ -971,7 +973,7 @@ impl Client {
 
     async fn force_close(&self) {
         self.inner.close();
-        self.cancel_handlers().await;
+        let _ = self.cancel_handlers(Instant::now() + self.inner.shutdown_timeout).await;
         for stored in [
             &self.inner.metrics_task,
             &self.inner.writer_task,
@@ -986,13 +988,14 @@ impl Client {
         lock(&self.inner.processes).clear();
     }
 
-    async fn cancel_handlers(&self) {
+    async fn cancel_handlers(&self, deadline: Instant) -> Result<()> {
         let mut tasks = std::mem::take(&mut *lock(&self.inner.handler_tasks));
         tasks.abort_all();
-        let _ = time::timeout(self.inner.shutdown_timeout, async {
+        time::timeout_at(deadline.into(), async {
             while tasks.join_next().await.is_some() {}
         })
-        .await;
+        .await
+        .map_err(|_| request_timeout("handler quiescence", self.inner.timeout))
     }
 
     async fn stop_transport(&self, deadline: Instant) -> Result<()> {
@@ -2592,10 +2595,22 @@ async fn metrics_loop(inner: Weak<Inner>) {
         if !client.is_connected() {
             return;
         }
+        let Ok(deadline) = deadline(client.inner.timeout) else { return; };
+        let Ok(_admission) = time::timeout_at(deadline.into(), client.inner.operation_gate.read()).await
+        else { continue; };
+        if !client.is_connected() || client.inner.closing.load(Ordering::Acquire) {
+            return;
+        }
         let processes: Vec<_> = lock(&client.inner.processes).values().cloned().collect();
         if !processes.is_empty() {
             let metrics: Vec<_> = processes.iter().map(|runtime| runtime.metrics()).collect();
-            let _ = client.report_worker_metrics(&metrics).await;
+            let pool = lock(&client.inner.pool).clone();
+            let _ = client.request_in_pool(
+                MessageType::WorkerMetrics,
+                json!({"metrics": metrics}),
+                Some(pool),
+                deadline.saturating_duration_since(Instant::now()),
+            ).await;
         }
     }
 }
