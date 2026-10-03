@@ -53,11 +53,17 @@ async fn real_pods_router_affinity_cross_owner_switch_and_same_owner_rejoin() {
     assert!(source.is_connected() && clone.is_connected());
     assert_eq!(clone.pool_name().await, other_pool);
     assert_eq!(clone.get::<Value>("isolation").await.unwrap(), None);
-    clone.subscribe("changed-pool").await.unwrap();
+    clone.subscribe_buffer("changed-pool").await.unwrap();
     clone.set("changed-pool", &json!({"clone": true})).await.unwrap();
-    let update = buffer_update(&mut events, "changed-pool").await;
-    assert_eq!(update.pool.as_deref(), Some(other_pool.as_str()));
-    assert_eq!(update.payload["buffer"]["value"], json!({"clone": true}));
+    let update = bounded(async {
+        for _ in 0..64 {
+            if let ClientEvent::Buffer(update) = events.recv().await.unwrap() {
+                if update.key == "changed-pool" { return update; }
+            }
+        }
+        panic!("new pool buffer event did not reach the original event subscription");
+    }).await;
+    assert_eq!(update.entry.value, json!({"clone": true}));
     clone.switch_pool(POOL, None).await.unwrap();
     assert_eq!(source.pool_name().await, POOL);
     assert_eq!(clone.get::<Value>("isolation").await.unwrap(), Some(value.clone()));
