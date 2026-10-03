@@ -479,6 +479,10 @@ impl Inner {
         self.switching.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         lock(&self.handler_tasks).abort_all();
+        for process in lock(&self.processes).values() {
+            process.close();
+        }
+        lock(&self.processes).clear();
         transport.sender.take();
         lock(&self.pending).clear();
         for stored in [&self.reader_task, &self.writer_task] {
@@ -701,6 +705,9 @@ async fn open_pool_connection(
     chain: &mut RedirectChain,
 ) -> Result<PreparedConnection> {
     loop {
+        if Instant::now() >= options.deadline {
+            return Err(request_timeout("pool connection", options.timeout));
+        }
         let address = endpoint.address();
         let connect = async {
             if endpoint.host.eq_ignore_ascii_case("localhost") {
@@ -772,6 +779,9 @@ async fn handshake_request(
     options: &HandshakeOptions,
 ) -> Result<Message> {
     let request_id = request.request_id.as_deref().unwrap();
+    if Instant::now() >= options.deadline {
+        return Err(request_timeout(request_id, options.timeout));
+    }
     let mut encoded = serde_json::to_vec(request)?;
     if encoded.len() > options.max_frame_bytes {
         return Err(Error::FrameTooLarge { size: encoded.len(), limit: options.max_frame_bytes });
@@ -782,6 +792,9 @@ async fn handshake_request(
         .await
         .map_err(|_| request_timeout(request_id, options.timeout))??;
     loop {
+        if Instant::now() >= options.deadline {
+            return Err(request_timeout(request_id, options.timeout));
+        }
         let frame = time::timeout_at(options.deadline.into(), read_frame(reader, options.max_frame_bytes))
             .await
             .map_err(|_| request_timeout(request_id, options.timeout))??
@@ -3200,7 +3213,7 @@ mod tests {
         let owner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let router_port = router.local_addr().unwrap().port();
         let owner_port = owner.local_addr().unwrap().port();
-        let (client, (mut old_reader, _old_writer)) = tokio::join!(
+        let (client, (mut old_reader, mut old_writer)) = tokio::join!(
             ClientBuilder::new("latzero://worker", "alpha").port(router_port).connect(),
             async {
                 let (socket, _) = router.accept().await.unwrap();
@@ -3249,7 +3262,7 @@ mod tests {
             }));
             let mut bytes = serde_json::to_vec(&redirect).unwrap();
             bytes.push(b'\n');
-            _old_writer.write_all(&bytes).await.unwrap();
+            old_writer.write_all(&bytes).await.unwrap();
             assert!(read_frame(&mut old_reader, 4096).await.unwrap().is_none());
             let (socket, _) = owner.accept().await.unwrap();
             let (reader, mut writer) = socket.into_split();
