@@ -352,8 +352,7 @@ async fn localhost_alias_and_two_endpoint_cycles_are_rejected_without_reconnect(
         let first_port = first.local_addr().unwrap().port();
         let second_port = second.local_addr().unwrap().port();
         let (result, ()) = bounded(async {
-            let mut connect = Box::pin(builder(first_port).host("localhost").connect());
-            let server = async {
+            tokio::join!(builder(first_port).host("localhost").connect(), async {
                 let mut peer = Peer::accept(&first).await;
                 peer.hello().await;
                 let join = peer.membership(POOL, None).await;
@@ -366,16 +365,7 @@ async fn localhost_alias_and_two_endpoint_cycles_are_rejected_without_reconnect(
                     peer.send(&redirect(&join, first_port, POOL)).await;
                     peer.closed().await;
                 }
-            };
-            tokio::pin!(server);
-            tokio::select! {
-                result = connect.as_mut() => {
-                    assert!(matches!(&result, Err(Error::Protocol(_))), "localhost connect failed before cycle: {:?}", result.err());
-                    server.await;
-                    (Err(Error::Protocol("cycle".to_owned())), ())
-                },
-                () = server.as_mut() => (connect.await, ()),
-            }
+            })
         }).await;
         assert!(matches!(result, Err(Error::Protocol(message)) if message.contains("cycle")));
         let mut accept = Box::pin(first.accept());

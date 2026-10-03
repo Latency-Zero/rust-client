@@ -238,7 +238,8 @@ impl ClientBuilder {
     }
 
     /// Bound local pool-owner redirects per connect or explicit pool switch.
-    /// Zero disables following redirects. No application request is replayed.
+    /// Defaults to four; accepts zero through sixteen. Zero disables following
+    /// redirects. No application request is replayed.
     #[must_use]
     pub const fn max_redirects(mut self, limit: usize) -> Self {
         self.max_redirects = limit;
@@ -275,6 +276,9 @@ impl ClientBuilder {
                     "{name} must be positive and within Tokio's capacity limit"
                 )));
             }
+        }
+        if self.max_redirects > 16 {
+            return Err(Error::Protocol("max_redirects must be between 0 and 16".to_owned()));
         }
         deadline(self.write_timeout)?;
         deadline(self.shutdown_timeout)?;
@@ -358,9 +362,6 @@ impl ClientBuilder {
 
         client.attach_transport(connection, &self.pool, self.auth_token.as_deref())?;
 
-        let metrics_inner = Arc::downgrade(&client.inner);
-        let metrics_task = tokio::spawn(metrics_loop(metrics_inner));
-        *lock(&client.inner.metrics_task) = Some(metrics_task);
         Ok(client)
     }
 }
@@ -645,9 +646,9 @@ impl RedirectChain {
             .as_u64()
             .filter(|count| (1..=64).contains(count))
             .ok_or_else(|| invalid("pod_count must be an integer between 1 and 64"))?;
-        if !message.payload["pod_index"]
+        if message.payload["pod_index"]
             .as_u64()
-            .is_some_and(|index| index < count)
+            .is_none_or(|index| index >= count)
         {
             return Err(invalid("pod_index must be an integer below pod_count"));
         }
@@ -701,7 +702,28 @@ async fn open_pool_connection(
 ) -> Result<PreparedConnection> {
     loop {
         let address = endpoint.address();
-        let stream = match time::timeout_at(options.deadline.into(), TcpStream::connect(&address)).await
+        let connect = async {
+            if endpoint.host.eq_ignore_ascii_case("localhost") {
+                // Race the two numeric local addresses: a stalled IPv6 connect
+                // must not consume the whole deadline before IPv4 is attempted.
+                let ipv4 = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, endpoint.port));
+                let ipv6 = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, endpoint.port));
+                tokio::pin!(ipv4, ipv6);
+                tokio::select! {
+                    result = &mut ipv4 => match result {
+                        Ok(stream) => Ok(stream),
+                        Err(_) => ipv6.await,
+                    },
+                    result = &mut ipv6 => match result {
+                        Ok(stream) => Ok(stream),
+                        Err(_) => ipv4.await,
+                    },
+                }
+            } else {
+                TcpStream::connect(&address).await
+            }
+        };
+        let stream = match time::timeout_at(options.deadline.into(), connect).await
         {
             Ok(Ok(stream)) => stream,
             Ok(Err(source)) => return Err(Error::Connection { endpoint: address, source }),
@@ -809,7 +831,7 @@ impl Client {
         self.inner.events.subscribe()
     }
 
-    /// Switch the existing connection to another isolated pool.
+    /// Switch pools, following bounded local owner redirects on the same client.
     pub async fn switch_pool(
         &self,
         pool: impl Into<String>,
@@ -1017,6 +1039,10 @@ impl Client {
             connection.reader,
             generation,
         )));
+        let mut metrics_task = lock(&self.inner.metrics_task);
+        if metrics_task.is_none() {
+            *metrics_task = Some(tokio::spawn(metrics_loop(Arc::downgrade(&self.inner))));
+        }
         self.inner.switching.store(false, Ordering::Release);
         Ok(())
     }
@@ -3089,6 +3115,29 @@ mod tests {
     }
 
     #[test]
+    fn remote_entry_cannot_redirect_to_numeric_loopback() {
+        let message = Message::new(
+            MessageType::Redirect,
+            Some("join".to_owned()),
+            Some("worker".to_owned()),
+            Some("alpha".to_owned()),
+            json!({
+                "protocol": REDIRECT_PROTOCOL, "host": "127.0.0.1", "port": 1234,
+                "pool": "alpha", "pod_index": 0, "pod_count": 4,
+                "router_host": "127.0.0.1", "router_port": 1235,
+                "cluster_id": "cluster",
+            }),
+        );
+        for host in ["192.0.2.1", "example.invalid", "localhost.evil", "0.0.0.0"] {
+            assert!(matches!(
+                RedirectChain::new(host, 4).follow(&message, "worker", "alpha"),
+                Err(Error::Protocol(_))
+            ));
+        }
+        assert!(RedirectChain::new("localhost", 4).follow(&message, "worker", "alpha").is_ok());
+    }
+
+    #[test]
     fn partial_delivery_keeps_destination_and_child_correlation_metadata() {
         let message = Message::new(
             MessageType::Error,
@@ -3139,9 +3188,83 @@ mod tests {
             ClientBuilder::new("latzero://invalid", "pool").timeout(Duration::ZERO),
             ClientBuilder::new("latzero://invalid", "pool").write_timeout(Duration::MAX),
             ClientBuilder::new("latzero://invalid", "pool").shutdown_timeout(Duration::MAX),
+            ClientBuilder::new("latzero://invalid", "pool").max_redirects(17),
         ] {
             assert!(matches!(builder.connect().await, Err(Error::Protocol(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn retired_connection_errors_cannot_close_replacement_and_tasks_are_reaped() {
+        let router = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let router_port = router.local_addr().unwrap().port();
+        let owner_port = owner.local_addr().unwrap().port();
+        let (client, (mut old_reader, _old_writer)) = tokio::join!(
+            ClientBuilder::new("latzero://worker", "alpha").port(router_port).connect(),
+            async {
+                let (socket, _) = router.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut reader = BufReader::new(reader);
+                for _ in 0..2 {
+                    let frame = read_frame(&mut reader, 4096).await.unwrap().unwrap();
+                    let request: Message = serde_json::from_slice(&frame).unwrap();
+                    let ack = Message::new(MessageType::Ack, request.request_id, request.client_id, request.pool, json!({}));
+                    let mut bytes = serde_json::to_vec(&ack).unwrap();
+                    bytes.push(b'\n');
+                    writer.write_all(&bytes).await.unwrap();
+                }
+                (reader, writer)
+            }
+        );
+        let client = client.unwrap();
+        let original_inner = Arc::clone(&client.inner);
+        let old_generation = client.inner.connection_generation.load(Ordering::Acquire);
+        let metrics_id = lock(&client.inner.metrics_task).as_ref().unwrap().id();
+        let switched = async {
+            client.switch_pool("beta", Some("token")).await.unwrap();
+            assert!(Arc::ptr_eq(&original_inner, &client.inner));
+            assert_eq!(lock(&client.inner.metrics_task).as_ref().unwrap().id(), metrics_id);
+            assert_eq!(client.inner.entry_endpoint.port, router_port);
+            assert_eq!(lock(&client.inner.transport).endpoint.port, owner_port);
+            assert!(lock(&client.inner.pending).is_empty());
+            assert_eq!(client.inner.queued_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(client.inner.handler_bytes.load(Ordering::Acquire), 0);
+            client.inner.close_connection(old_generation);
+            assert!(client.is_connected());
+            client.clients().await.unwrap();
+            client.force_close().await;
+            assert!(lock(&client.inner.reader_task).is_none());
+            assert!(lock(&client.inner.writer_task).is_none());
+            assert!(lock(&client.inner.metrics_task).is_none());
+        };
+        let peer = async {
+            let frame = read_frame(&mut old_reader, 4096).await.unwrap().unwrap();
+            let request: Message = serde_json::from_slice(&frame).unwrap();
+            let redirect = Message::new(MessageType::Redirect, request.request_id, request.client_id, request.pool, json!({
+                "protocol": REDIRECT_PROTOCOL, "host": "127.0.0.1", "port": owner_port,
+                "pool": "beta", "pod_index": 1, "pod_count": 4,
+                "router_host": "127.0.0.1", "router_port": router_port,
+                "cluster_id": "cluster",
+            }));
+            let mut bytes = serde_json::to_vec(&redirect).unwrap();
+            bytes.push(b'\n');
+            _old_writer.write_all(&bytes).await.unwrap();
+            assert!(read_frame(&mut old_reader, 4096).await.unwrap().is_none());
+            let (socket, _) = owner.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = BufReader::new(reader);
+            for _ in 0..3 {
+                let frame = read_frame(&mut reader, 4096).await.unwrap().unwrap();
+                let request: Message = serde_json::from_slice(&frame).unwrap();
+                let ack = Message::new(MessageType::Ack, request.request_id, request.client_id, request.pool, json!({"clients": ["worker"]}));
+                let mut bytes = serde_json::to_vec(&ack).unwrap();
+                bytes.push(b'\n');
+                writer.write_all(&bytes).await.unwrap();
+            }
+            assert!(read_frame(&mut reader, 4096).await.unwrap().is_none());
+        };
+        time::timeout(Duration::from_secs(4), async { tokio::join!(switched, peer); }).await.unwrap();
     }
 
     #[test]
