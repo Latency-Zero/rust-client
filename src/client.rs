@@ -436,6 +436,13 @@ impl Inner {
         }
     }
 
+    fn close_work_generation(&self, generation: u64) {
+        let mut transport = lock(&self.transport);
+        if self.generation.load(Ordering::Acquire) == generation {
+            self.close_locked(&mut transport);
+        }
+    }
+
     fn close_locked(&self, transport: &mut Transport) {
         self.closing.store(true, Ordering::Release);
         if self.connected.swap(false, Ordering::AcqRel) {
@@ -636,8 +643,8 @@ impl RedirectChain {
             .ok_or_else(|| invalid("router_host must be numeric loopback"))?;
         let count = message.payload["pod_count"]
             .as_u64()
-            .filter(|count| *count > 0)
-            .ok_or_else(|| invalid("pod_count must be a positive integer"))?;
+            .filter(|count| (1..=64).contains(count))
+            .ok_or_else(|| invalid("pod_count must be an integer between 1 and 64"))?;
         if !message.payload["pod_index"]
             .as_u64()
             .is_some_and(|index| index < count)
@@ -833,7 +840,9 @@ impl Client {
             self.inner.switching.store(true, Ordering::Release);
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
             lock(&self.inner.pending).clear();
-            self.cancel_handlers().await;
+            time::timeout_at(deadline.into(), self.cancel_handlers())
+                .await
+                .map_err(|_| request_timeout("switch_pool", timeout))?;
         }
         let mut result = self
             .request_in_pool(
@@ -862,7 +871,9 @@ impl Client {
             chain.visited.insert(peer_addr);
             result = async {
                 let endpoint = chain.follow(result.as_ref().unwrap(), self.client_id(), &pool)?;
-                self.cancel_handlers().await;
+                time::timeout_at(deadline.into(), self.cancel_handlers())
+                    .await
+                    .map_err(|_| request_timeout("pool redirect handoff", timeout))?;
                 self.stop_transport(deadline).await?;
                 let connection = open_pool_connection(
                     endpoint,
@@ -2299,7 +2310,7 @@ impl Client {
         let deadline = match deadline(self.inner.timeout) {
             Ok(value) => value,
             Err(_) => {
-                self.inner.close();
+                self.inner.close_work_generation(generation);
                 return;
             }
         };
@@ -2318,7 +2329,7 @@ impl Client {
                 event: event.to_owned(),
                 error: error.to_string(),
             });
-            self.inner.close();
+            self.inner.close_work_generation(generation);
         }
     }
 }
