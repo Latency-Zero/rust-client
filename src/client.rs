@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     future::{Future, poll_fn},
+    net::{IpAddr, SocketAddr},
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
@@ -111,6 +112,7 @@ pub struct ClientBuilder {
     control_reserve_bytes: usize,
     write_timeout: Duration,
     shutdown_timeout: Duration,
+    max_redirects: usize,
 }
 
 impl ClientBuilder {
@@ -135,6 +137,7 @@ impl ClientBuilder {
             control_reserve_bytes: 64 * 1024,
             write_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(1),
+            max_redirects: 4,
         }
     }
 
@@ -234,7 +237,15 @@ impl ClientBuilder {
         self
     }
 
-    /// Open the TCP connection, perform `hello`, and join the configured pool.
+    /// Bound local pool-owner redirects per connect or explicit pool switch.
+    /// Zero disables following redirects. No application request is replayed.
+    #[must_use]
+    pub const fn max_redirects(mut self, limit: usize) -> Self {
+        self.max_redirects = limit;
+        self
+    }
+
+    /// Open TCP, perform `hello`, and join, sharing one deadline across all hops.
     pub async fn connect(self) -> Result<Client> {
         let client_id = parse_dsn(&self.dsn)?;
         require_nonempty("pool", &self.pool)?;
@@ -269,24 +280,6 @@ impl ClientBuilder {
         deadline(self.shutdown_timeout)?;
         let deadline = deadline(self.timeout)?;
 
-        let endpoint = format!("{}:{}", self.host, self.port);
-        let stream = match time::timeout(self.timeout, TcpStream::connect(&endpoint)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(source)) => {
-                return Err(Error::Connection { endpoint, source });
-            }
-            Err(_) => {
-                return Err(Error::Connection {
-                    endpoint,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "connection timed out",
-                    ),
-                });
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        let (reader, writer) = stream.into_split();
         let channel_capacity = self
             .writer_capacity
             .checked_add(self.control_reserve)
@@ -294,7 +287,25 @@ impl ClientBuilder {
             .ok_or_else(|| {
                 Error::Protocol("writer capacity plus control reserve is too large".to_owned())
             })?;
-        let (writer_sender, writer_receiver) = mpsc::channel(channel_capacity);
+        let entry_endpoint = Endpoint {
+            host: self.host.clone(),
+            port: self.port,
+        };
+        let options = HandshakeOptions {
+            deadline,
+            timeout: self.timeout,
+            write_timeout: self.write_timeout,
+            max_frame_bytes: self.max_frame_bytes,
+        };
+        let connection = open_pool_connection(
+            entry_endpoint.clone(),
+            &client_id,
+            &self.pool,
+            self.auth_token.as_deref(),
+            &options,
+            &mut RedirectChain::new(&self.host, self.max_redirects),
+        )
+        .await?;
         let (event_sender, _) = broadcast::channel(self.event_capacity);
 
         let client = Client {
@@ -311,11 +322,18 @@ impl ClientBuilder {
                 max_queued_bytes: self.max_queued_bytes,
                 control_reserve_bytes: self.control_reserve_bytes,
                 max_handler_bytes: self.max_handler_bytes,
+                entry_endpoint,
+                max_redirects: self.max_redirects,
+                writer_channel_capacity: channel_capacity,
                 writer_slots: Arc::new(Semaphore::new(self.writer_capacity)),
                 handler_slots: Arc::new(Semaphore::new(self.max_handler_tasks)),
                 queued_bytes: Arc::new(AtomicUsize::new(0)),
                 handler_bytes: Arc::new(AtomicUsize::new(0)),
-                writer_sender,
+                transport: StdMutex::new(Transport {
+                    endpoint: connection.endpoint.clone(),
+                    peer_addr: connection.peer_addr,
+                    sender: None,
+                }),
                 pending: StdMutex::new(HashMap::new()),
                 event_handlers: RwLock::new(HashMap::new()),
                 processes: StdMutex::new(HashMap::new()),
@@ -323,6 +341,7 @@ impl ClientBuilder {
                 connected: AtomicBool::new(true),
                 closing: AtomicBool::new(false),
                 generation: AtomicU64::new(0),
+                connection_generation: AtomicU64::new(0),
                 switching: AtomicBool::new(false),
                 operation_gate: RwLock::new(()),
                 transition_slots: Arc::new(Semaphore::new(self.max_pending_requests)),
@@ -337,40 +356,7 @@ impl ClientBuilder {
         let mut client = client;
         client.owner = Some(Arc::new(ConnectionOwner(Arc::downgrade(&client.inner))));
 
-        let writer_task = tokio::spawn(writer_loop(
-            Arc::downgrade(&client.inner),
-            writer,
-            writer_receiver,
-        ));
-        *lock(&client.inner.writer_task) = Some(writer_task);
-        let reader_inner = Arc::downgrade(&client.inner);
-        let reader_task = tokio::spawn(read_loop(reader_inner, reader));
-        *lock(&client.inner.reader_task) = Some(reader_task);
-
-        if let Err(error) = client
-            .request_in_pool(
-                MessageType::Hello,
-                json!({ "client_id": client.inner.client_id }),
-                None,
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .await
-        {
-            client.force_close().await;
-            return Err(error);
-        }
-
-        if let Err(error) = client
-            .join_pool(
-                &self.pool,
-                self.auth_token.as_deref(),
-                deadline.saturating_duration_since(Instant::now()),
-            )
-            .await
-        {
-            client.force_close().await;
-            return Err(error);
-        }
+        client.attach_transport(connection, &self.pool, self.auth_token.as_deref())?;
 
         let metrics_inner = Arc::downgrade(&client.inner);
         let metrics_task = tokio::spawn(metrics_loop(metrics_inner));
@@ -411,11 +397,14 @@ struct Inner {
     max_queued_bytes: usize,
     control_reserve_bytes: usize,
     max_handler_bytes: usize,
+    entry_endpoint: Endpoint,
+    max_redirects: usize,
+    writer_channel_capacity: usize,
     writer_slots: Arc<Semaphore>,
     handler_slots: Arc<Semaphore>,
     queued_bytes: Arc<AtomicUsize>,
     handler_bytes: Arc<AtomicUsize>,
-    writer_sender: mpsc::Sender<WriterCommand>,
+    transport: StdMutex<Transport>,
     pending: StdMutex<HashMap<String, PendingSlot>>,
     event_handlers: RwLock<HashMap<String, Vec<(EventHandlerId, Handler)>>>,
     processes: StdMutex<HashMap<String, Arc<ProcessRuntime>>>,
@@ -423,6 +412,7 @@ struct Inner {
     connected: AtomicBool,
     closing: AtomicBool,
     generation: AtomicU64,
+    connection_generation: AtomicU64,
     switching: AtomicBool,
     operation_gate: RwLock<()>,
     transition_slots: Arc<Semaphore>,
@@ -435,8 +425,21 @@ struct Inner {
 
 impl Inner {
     fn close(&self) {
+        let mut transport = lock(&self.transport);
+        self.close_locked(&mut transport);
+    }
+
+    fn close_connection(&self, generation: u64) {
+        let mut transport = lock(&self.transport);
+        if self.connection_generation.load(Ordering::Acquire) == generation {
+            self.close_locked(&mut transport);
+        }
+    }
+
+    fn close_locked(&self, transport: &mut Transport) {
         self.closing.store(true, Ordering::Release);
         if self.connected.swap(false, Ordering::AcqRel) {
+            transport.sender.take();
             lock(&self.pending).clear();
             self.writer_slots.close();
             self.handler_slots.close();
@@ -452,6 +455,30 @@ impl Inner {
             }
             let _ = self.events.send(ClientEvent::Disconnected);
         }
+    }
+
+    fn connection_is_current(&self, generation: u64) -> bool {
+        self.connected.load(Ordering::Acquire)
+            && self.connection_generation.load(Ordering::Acquire) == generation
+    }
+
+    fn retire_connection(&self, generation: u64) -> bool {
+        let mut transport = lock(&self.transport);
+        if !self.connection_is_current(generation) {
+            return false;
+        }
+        self.connection_generation.fetch_add(1, Ordering::AcqRel);
+        self.switching.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        lock(&self.handler_tasks).abort_all();
+        transport.sender.take();
+        lock(&self.pending).clear();
+        for stored in [&self.reader_task, &self.writer_task] {
+            if let Some(task) = lock(stored).as_ref() {
+                task.abort();
+            }
+        }
+        true
     }
 }
 
@@ -471,6 +498,7 @@ enum WriterCommand {
         bytes: Vec<u8>,
         deadline: Instant,
         generation: u64,
+        connection_generation: u64,
         request: Option<Arc<AtomicUsize>>,
         _slot: Option<OwnedSemaphorePermit>,
         _bytes: ByteReservation,
@@ -512,10 +540,235 @@ struct PendingSlot {
     sender: mpsc::Sender<Message>,
     kind: MessageType,
     generation: u64,
+    connection_generation: u64,
     acknowledgement: bool,
     terminal: bool,
     membership: Option<(String, Option<String>)>,
     expects_result: bool,
+}
+
+const REDIRECT_PROTOCOL: &str = "pool_redirect_v1";
+
+#[derive(Clone)]
+struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+impl Endpoint {
+    fn address(&self) -> String {
+        match self.host.parse::<IpAddr>() {
+            Ok(ip) => SocketAddr::new(ip, self.port).to_string(),
+            Err(_) => format!("{}:{}", self.host, self.port),
+        }
+    }
+}
+
+struct Transport {
+    endpoint: Endpoint,
+    peer_addr: SocketAddr,
+    sender: Option<mpsc::Sender<WriterCommand>>,
+}
+
+struct PreparedConnection {
+    endpoint: Endpoint,
+    peer_addr: SocketAddr,
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+struct HandshakeOptions {
+    deadline: Instant,
+    timeout: Duration,
+    write_timeout: Duration,
+    max_frame_bytes: usize,
+}
+
+struct RedirectChain {
+    local_entry: bool,
+    limit: usize,
+    redirects: usize,
+    visited: HashSet<SocketAddr>,
+    ownership: Option<(String, u64)>,
+}
+
+impl RedirectChain {
+    fn new(host: &str, limit: usize) -> Self {
+        Self {
+            local_entry: host.eq_ignore_ascii_case("localhost")
+                || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+            limit,
+            redirects: 0,
+            visited: HashSet::new(),
+            ownership: None,
+        }
+    }
+
+    fn follow(&mut self, message: &Message, client_id: &str, pool: &str) -> Result<Endpoint> {
+        let invalid = |field: &str| Error::Protocol(format!("invalid pool redirect: {field}"));
+        if message.kind != MessageType::Redirect.as_str()
+            || message.client_id.as_deref() != Some(client_id)
+            || message.pool.as_deref() != Some(pool)
+            || message.payload["protocol"].as_str() != Some(REDIRECT_PROTOCOL)
+            || message.payload["pool"].as_str() != Some(pool)
+        {
+            return Err(invalid("protocol, client, or requested pool mismatch"));
+        }
+        if !self.local_entry {
+            return Err(invalid("configured entry host is not local"));
+        }
+        let host = message.payload["host"]
+            .as_str()
+            .ok_or_else(|| invalid("host"))?;
+        let ip = host
+            .parse::<IpAddr>()
+            .ok()
+            .filter(IpAddr::is_loopback)
+            .ok_or_else(|| invalid("target must be a numeric loopback address"))?;
+        let port = redirect_port(&message.payload, "port", false)?.unwrap();
+        redirect_port(&message.payload, "ws_port", true)?;
+        redirect_port(&message.payload, "router_port", false)?;
+        redirect_port(&message.payload, "router_ws_port", true)?;
+        message.payload["router_host"]
+            .as_str()
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .filter(IpAddr::is_loopback)
+            .ok_or_else(|| invalid("router_host must be numeric loopback"))?;
+        let count = message.payload["pod_count"]
+            .as_u64()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| invalid("pod_count must be a positive integer"))?;
+        if !message.payload["pod_index"]
+            .as_u64()
+            .is_some_and(|index| index < count)
+        {
+            return Err(invalid("pod_index must be an integer below pod_count"));
+        }
+        let cluster = message.payload["cluster_id"]
+            .as_str()
+            .filter(|cluster| !cluster.is_empty() && cluster.len() <= 512)
+            .ok_or_else(|| invalid("cluster_id"))?;
+        if self
+            .ownership
+            .as_ref()
+            .is_some_and(|(known, pods)| known != cluster || *pods != count)
+        {
+            return Err(invalid("cluster or pod count changed within redirect chain"));
+        }
+        if self.redirects >= self.limit {
+            return Err(invalid("redirect limit exceeded"));
+        }
+        let endpoint = SocketAddr::new(ip, port);
+        if !self.visited.insert(endpoint) {
+            return Err(invalid("endpoint cycle"));
+        }
+        self.ownership = Some((cluster.to_owned(), count));
+        self.redirects += 1;
+        Ok(Endpoint {
+            host: ip.to_string(),
+            port,
+        })
+    }
+}
+
+fn redirect_port(payload: &Value, name: &str, optional: bool) -> Result<Option<u16>> {
+    let value = &payload[name];
+    if optional && value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .map(Some)
+        .ok_or_else(|| Error::Protocol(format!("invalid pool redirect: {name} must be a nonzero u16")))
+}
+
+async fn open_pool_connection(
+    mut endpoint: Endpoint,
+    client_id: &str,
+    pool: &str,
+    auth_token: Option<&str>,
+    options: &HandshakeOptions,
+    chain: &mut RedirectChain,
+) -> Result<PreparedConnection> {
+    loop {
+        let address = endpoint.address();
+        let stream = match time::timeout_at(options.deadline.into(), TcpStream::connect(&address)).await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(source)) => return Err(Error::Connection { endpoint: address, source }),
+            Err(_) => return Err(Error::Connection {
+                endpoint: address,
+                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"),
+            }),
+        };
+        let peer_addr = stream.peer_addr()?;
+        chain.visited.insert(peer_addr);
+        let _ = stream.set_nodelay(true);
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let hello = Message::new(
+            MessageType::Hello,
+            Some(Uuid::new_v4().to_string()),
+            Some(client_id.to_owned()),
+            None,
+            json!({"client_id": client_id, "capabilities": [REDIRECT_PROTOCOL]}),
+        );
+        handshake_request(&mut reader, &mut writer, &hello, options).await?;
+        let join = Message::new(
+            MessageType::JoinPool,
+            Some(Uuid::new_v4().to_string()),
+            Some(client_id.to_owned()),
+            Some(pool.to_owned()),
+            json!({"client_id": client_id, "pool": pool, "auth_token": auth_token}),
+        );
+        let reply = handshake_request(&mut reader, &mut writer, &join, options).await?;
+        if reply.kind == MessageType::Redirect.as_str() {
+            endpoint = chain.follow(&reply, client_id, pool)?;
+            // Drop both halves before opening the owner. No old buffered work
+            // or application request is carried over to the new connection.
+            drop(reader);
+            drop(writer);
+            continue;
+        }
+        return Ok(PreparedConnection { endpoint, peer_addr, reader, writer });
+    }
+}
+
+async fn handshake_request(
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut OwnedWriteHalf,
+    request: &Message,
+    options: &HandshakeOptions,
+) -> Result<Message> {
+    let request_id = request.request_id.as_deref().unwrap();
+    let mut encoded = serde_json::to_vec(request)?;
+    if encoded.len() > options.max_frame_bytes {
+        return Err(Error::FrameTooLarge { size: encoded.len(), limit: options.max_frame_bytes });
+    }
+    encoded.push(b'\n');
+    let write_deadline = options.deadline.min(deadline(options.write_timeout)?);
+    time::timeout_at(write_deadline.into(), writer.write_all(&encoded))
+        .await
+        .map_err(|_| request_timeout(request_id, options.timeout))??;
+    loop {
+        let frame = time::timeout_at(options.deadline.into(), read_frame(reader, options.max_frame_bytes))
+            .await
+            .map_err(|_| request_timeout(request_id, options.timeout))??
+            .ok_or(Error::Disconnected)?;
+        let message: Message = serde_json::from_slice(&frame)?;
+        if message.kind.is_empty() || !(message.payload.is_object() || message.payload.is_null()) {
+            return Err(Error::Protocol("invalid handshake envelope".to_owned()));
+        }
+        if message.request_id.as_deref() == Some(request_id) {
+            match message.kind.as_str() {
+                "ack" | "error" => return check_response(message),
+                "redirect" if request.kind == MessageType::JoinPool.as_str() => return Ok(message),
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Client {
@@ -567,10 +820,14 @@ impl Client {
             .map_err(|_| request_timeout("switch_pool", timeout))?;
         let pool = pool.into();
         require_nonempty("pool", &pool)?;
+        if !self.is_connected() || self.inner.closing.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        let peer_addr = lock(&self.inner.transport).peer_addr;
         let changed = pool != *lock(&self.inner.pool);
         let mut transition = TransitionGuard {
             inner: Arc::clone(&self.inner),
-            armed: changed,
+            armed: true,
         };
         if changed {
             self.inner.switching.store(true, Ordering::Release);
@@ -578,7 +835,7 @@ impl Client {
             lock(&self.inner.pending).clear();
             self.cancel_handlers().await;
         }
-        let result = self
+        let mut result = self
             .request_in_pool(
                 MessageType::SwitchPool,
                 json!({
@@ -590,10 +847,42 @@ impl Client {
                 deadline.saturating_duration_since(Instant::now()),
             )
             .await;
+        let redirected = result
+            .as_ref()
+            .is_ok_and(|message| message.kind == MessageType::Redirect.as_str());
+        if redirected {
+            let options = HandshakeOptions {
+                deadline,
+                timeout,
+                write_timeout: self.inner.write_timeout,
+                max_frame_bytes: self.inner.max_frame_bytes,
+            };
+            let mut chain =
+                RedirectChain::new(&self.inner.entry_endpoint.host, self.inner.max_redirects);
+            chain.visited.insert(peer_addr);
+            result = async {
+                let endpoint = chain.follow(result.as_ref().unwrap(), self.client_id(), &pool)?;
+                self.cancel_handlers().await;
+                self.stop_transport(deadline).await?;
+                let connection = open_pool_connection(
+                    endpoint,
+                    self.client_id(),
+                    &pool,
+                    auth_token,
+                    &options,
+                    &mut chain,
+                )
+                .await?;
+                self.attach_transport(connection, &pool, auth_token)?;
+                Ok(Message::new(MessageType::Ack, None, None, None, json!({})))
+            }
+            .await;
+        }
         if !matches!(
             result,
             Err(Error::Timeout { .. } | Error::Disconnected | Error::Io(_))
-        ) {
+        ) && (!redirected || result.is_ok())
+        {
             transition.armed = false;
             self.inner.switching.store(false, Ordering::Release);
         }
@@ -660,23 +949,64 @@ impl Client {
         .await;
     }
 
-    async fn join_pool(
+    async fn stop_transport(&self, deadline: Instant) -> Result<()> {
+        for stored in [&self.inner.reader_task, &self.inner.writer_task] {
+            let task = lock(stored).take();
+            if let Some(mut task) = task {
+                task.abort();
+                time::timeout_at(deadline.into(), &mut task)
+                    .await
+                    .map_err(|_| request_timeout("pool redirect handoff", self.inner.timeout))?
+                    .ok();
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(request_timeout("pool redirect handoff", self.inner.timeout));
+        }
+        Ok(())
+    }
+
+    fn attach_transport(
         &self,
+        connection: PreparedConnection,
         pool: &str,
         auth_token: Option<&str>,
-        timeout: Duration,
     ) -> Result<()> {
-        self.request_in_pool(
-            MessageType::JoinPool,
-            json!({
-                "client_id": self.inner.client_id,
-                "pool": pool,
-                "auth_token": auth_token,
-            }),
-            Some(pool.to_owned()),
-            timeout,
-        )
-        .await?;
+        let mut transport = lock(&self.inner.transport);
+        if !self.is_connected() || self.inner.closing.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        let mut reader_task = lock(&self.inner.reader_task);
+        let mut writer_task = lock(&self.inner.writer_task);
+        if reader_task.is_some() || writer_task.is_some() {
+            return Err(Error::Protocol("old transport tasks were not reaped".to_owned()));
+        }
+        let changed = pool != *lock(&self.inner.pool);
+        *lock(&self.inner.pool) = pool.to_owned();
+        *lock(&self.inner.auth_token) = auth_token.map(str::to_owned);
+        if changed {
+            for process in lock(&self.inner.processes).values() {
+                process.close();
+            }
+            lock(&self.inner.processes).clear();
+        }
+        let (sender, receiver) = mpsc::channel(self.inner.writer_channel_capacity);
+        transport.endpoint = connection.endpoint;
+        transport.peer_addr = connection.peer_addr;
+        transport.sender = Some(sender);
+        let generation = self.inner.connection_generation.load(Ordering::Acquire);
+        *writer_task = Some(tokio::spawn(writer_loop(
+            Arc::downgrade(&self.inner),
+            connection.writer,
+            receiver,
+            generation,
+        )));
+        *reader_task = Some(tokio::spawn(read_loop(
+            Arc::downgrade(&self.inner),
+            connection.reader,
+            generation,
+        )));
+        self.inner.switching.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1495,7 +1825,11 @@ impl Client {
             &mut pending,
             deadline,
             timeout,
-            &[MessageType::Ack],
+            if matches!(kind, MessageType::JoinPool | MessageType::SwitchPool) {
+                &[MessageType::Ack, MessageType::Redirect]
+            } else {
+                &[MessageType::Ack]
+            },
         )
         .await
     }
@@ -1514,6 +1848,7 @@ impl Client {
         }
         let (sender, receiver) = mpsc::channel(2);
         let generation = self.inner.generation.load(Ordering::Acquire);
+        let connection_generation = self.inner.connection_generation.load(Ordering::Acquire);
         let membership = if matches!(kind, MessageType::JoinPool | MessageType::SwitchPool) {
             Some((
                 message.payload["pool"]
@@ -1525,6 +1860,7 @@ impl Client {
         } else {
             None
         };
+        let is_membership = membership.is_some();
         {
             let mut slots = lock(&self.inner.pending);
             if !self.is_connected() {
@@ -1541,6 +1877,7 @@ impl Client {
                     sender,
                     kind,
                     generation,
+                    connection_generation,
                     acknowledgement: false,
                     terminal: false,
                     membership,
@@ -1558,6 +1895,8 @@ impl Client {
             inner: Arc::downgrade(&self.inner),
             status: Arc::clone(&status),
             generation,
+            connection_generation,
+            membership: is_membership,
         };
         self.send_message(
             &message,
@@ -1578,7 +1917,15 @@ impl Client {
         expected: &[MessageType],
     ) -> Result<Message> {
         loop {
-            if pending.generation != self.inner.generation.load(Ordering::Acquire) {
+            if !pending.membership
+                && pending.generation != self.inner.generation.load(Ordering::Acquire)
+            {
+                return Err(Error::Disconnected);
+            }
+            if !pending.membership
+                && pending.connection_generation
+                    != self.inner.connection_generation.load(Ordering::Acquire)
+            {
                 return Err(Error::Disconnected);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1598,7 +1945,15 @@ impl Client {
                     });
                 }
             };
-            if pending.generation != self.inner.generation.load(Ordering::Acquire) {
+            if !pending.membership
+                && pending.generation != self.inner.generation.load(Ordering::Acquire)
+            {
+                return Err(Error::Disconnected);
+            }
+            if !pending.membership
+                && pending.connection_generation
+                    != self.inner.connection_generation.load(Ordering::Acquire)
+            {
                 return Err(Error::Disconnected);
             }
             if message.kind == MessageType::Error.as_str()
@@ -1658,12 +2013,19 @@ impl Client {
             byte_limit,
             "writer bytes",
         )?;
-        self.inner
-            .writer_sender
+        let transport = lock(&self.inner.transport);
+        if !self.is_connected() || generation != self.inner.generation.load(Ordering::Acquire) {
+            return Err(Error::Disconnected);
+        }
+        transport
+            .sender
+            .as_ref()
+            .ok_or(Error::Disconnected)?
             .try_send(WriterCommand::Frame {
                 bytes: encoded,
                 deadline,
                 generation,
+                connection_generation: self.inner.connection_generation.load(Ordering::Acquire),
                 request,
                 _slot: slot,
                 _bytes: bytes,
@@ -1914,6 +2276,12 @@ impl Client {
         generation: u64,
         pool: String,
     ) {
+        if generation != self.inner.generation.load(Ordering::Acquire)
+            || !self.is_connected()
+            || self.inner.closing.load(Ordering::Acquire)
+        {
+            return;
+        }
         let payload = match result {
             Ok(value) => json!({ "value": value, "error": null }),
             Err(error) => json!({
@@ -1941,6 +2309,11 @@ impl Client {
             sent = self.send_message(&response, deadline, generation, None, true);
         }
         if let Err(error) = sent {
+            if generation != self.inner.generation.load(Ordering::Acquire)
+                || !self.is_connected()
+            {
+                return;
+            }
             let _ = self.inner.events.send(ClientEvent::HandlerFailed {
                 event: event.to_owned(),
                 error: error.to_string(),
@@ -1954,6 +2327,7 @@ async fn writer_loop(
     inner: Weak<Inner>,
     mut writer: OwnedWriteHalf,
     mut receiver: mpsc::Receiver<WriterCommand>,
+    connection_generation: u64,
 ) {
     while let Some(command) = receiver.recv().await {
         let Some(state) = inner.upgrade() else {
@@ -1963,19 +2337,22 @@ async fn writer_loop(
             bytes,
             deadline,
             generation,
+            connection_generation: frame_connection_generation,
             request,
             _slot,
             _bytes,
         } = command;
-        if !state.connected.load(Ordering::Acquire) {
+        if !state.connection_is_current(connection_generation) {
             break;
         }
-        if state.generation.load(Ordering::Acquire) != generation {
+        if state.generation.load(Ordering::Acquire) != generation
+            || frame_connection_generation != connection_generation
+        {
             continue;
         }
         if deadline <= Instant::now() {
             if request.is_none() {
-                state.close();
+                state.close_connection(connection_generation);
                 break;
             }
             continue;
@@ -1993,20 +2370,23 @@ async fn writer_loop(
             time::timeout_at(limit.into(), writer.write_all(&bytes)).await,
             Ok(Ok(()))
         ) {
-            state.close();
+            state.close_connection(connection_generation);
             break;
         }
     }
     let _ = writer.shutdown().await;
 }
 
-async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
-    let mut reader = BufReader::new(reader);
+async fn read_loop(
+    inner: Weak<Inner>,
+    mut reader: BufReader<OwnedReadHalf>,
+    connection_generation: u64,
+) {
     loop {
         let Some(state) = inner.upgrade() else {
             return;
         };
-        if !state.connected.load(Ordering::Acquire) {
+        if !state.connection_is_current(connection_generation) {
             return;
         }
         let limit = state.max_frame_bytes;
@@ -2019,6 +2399,9 @@ async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
         let Some(state) = inner.upgrade() else {
             return;
         };
+        if !state.connection_is_current(connection_generation) {
+            return;
+        }
         let client = Client {
             inner: Arc::clone(&state),
             owner: None,
@@ -2031,7 +2414,7 @@ async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
                 message
             }
             Ok(_) => {
-                state.close();
+                state.close_connection(connection_generation);
                 break;
             }
             Err(error) => {
@@ -2039,19 +2422,24 @@ async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
                     event: "protocol".to_owned(),
                     error: error.to_string(),
                 });
-                state.close();
+                state.close_connection(connection_generation);
                 break;
             }
         };
         let mut correlated = false;
+        let mut redirect_sender = None;
         if let Some(request_id) = message.request_id.as_ref() {
             let mut pending = lock(&state.pending);
             if let Some(slot) = pending.get_mut(request_id) {
                 let reply = message.kind.as_str();
                 let is_rpc = matches!(slot.kind, MessageType::CallApp | MessageType::CallProcess);
+                let is_membership =
+                    matches!(slot.kind, MessageType::JoinPool | MessageType::SwitchPool);
                 if slot.generation == state.generation.load(Ordering::Acquire)
+                    && slot.connection_generation == connection_generation
                     && (reply == "error"
                         || reply == "app_result" && slot.expects_result
+                        || reply == "redirect" && is_membership
                         || reply == "ack"
                             && (!is_rpc || message.payload["queued"].as_bool() == Some(true)))
                 {
@@ -2075,14 +2463,26 @@ async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
                         } else {
                             slot.terminal = true;
                         }
-                        if slot.sender.try_send(message.clone()).is_err() {
+                        if reply == "redirect" {
+                            redirect_sender = Some(slot.sender.clone());
+                        } else if slot.sender.try_send(message.clone()).is_err() {
                             drop(pending);
-                            state.close();
+                            state.close_connection(connection_generation);
                             break;
                         }
                     }
                 }
             }
+        }
+        if let Some(sender) = redirect_sender {
+            // The router closes this socket. Fence it before EOF or an old
+            // writer failure can touch the replacement connection.
+            if state.retire_connection(connection_generation)
+                && sender.try_send(message).is_err()
+            {
+                state.close();
+            }
+            return;
         }
         if !correlated {
             client.dispatch_message(message).await;
@@ -2090,7 +2490,7 @@ async fn read_loop(inner: Weak<Inner>, reader: OwnedReadHalf) {
     }
 
     if let Some(state) = inner.upgrade() {
-        state.close();
+        state.close_connection(connection_generation);
     }
 }
 
@@ -2156,6 +2556,8 @@ struct PendingResponse {
     inner: Weak<Inner>,
     status: Arc<AtomicUsize>,
     generation: u64,
+    connection_generation: u64,
+    membership: bool,
 }
 
 impl Drop for PendingResponse {
