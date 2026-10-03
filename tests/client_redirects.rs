@@ -2,7 +2,10 @@ use std::{
     fmt::Debug,
     future::{Future, poll_fn},
     pin::Pin,
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::Poll,
     time::Duration,
 };
@@ -11,7 +14,10 @@ use latzero::{CallOutcome, Client, ClientBuilder, ClientEvent, Error, Message, P
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, tcp::{OwnedReadHalf, OwnedWriteHalf}},
+    net::{
+        TcpListener,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{Semaphore, broadcast, mpsc},
     time,
 };
@@ -21,7 +27,9 @@ const ID: &str = "redirect-worker";
 const POOL: &str = "alpha";
 
 async fn bounded<F: Future>(future: F) -> F::Output {
-    time::timeout(WAIT, future).await.expect("redirect test barrier timed out")
+    time::timeout(WAIT, future)
+        .await
+        .expect("redirect test barrier timed out")
 }
 
 struct Peer {
@@ -34,7 +42,10 @@ impl Peer {
         let (socket, _) = bounded(listener.accept()).await.unwrap();
         socket.set_nodelay(true).unwrap();
         let (reader, writer) = socket.into_split();
-        Self { reader: BufReader::new(reader), writer }
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+        }
     }
 
     async fn read_optional(&mut self) -> Option<Message> {
@@ -47,7 +58,9 @@ impl Peer {
     }
 
     async fn read(&mut self) -> Message {
-        self.read_optional().await.expect("client closed before expected frame")
+        self.read_optional()
+            .await
+            .expect("client closed before expected frame")
     }
 
     async fn application(&mut self) -> Message {
@@ -60,7 +73,8 @@ impl Peer {
                     return message;
                 }
             }
-        }).await
+        })
+        .await
     }
 
     async fn send(&mut self, message: &Message) {
@@ -77,8 +91,12 @@ impl Peer {
         let hello = self.read().await;
         assert_eq!(hello.kind, "hello");
         assert_eq!(hello.client_id.as_deref(), Some(ID));
-        assert_eq!(hello.payload, json!({"client_id": ID, "capabilities": ["pool_redirect_v1"]}));
-        self.reply(&hello, "ack", json!({"server": "legacy-or-pod"})).await;
+        assert_eq!(
+            hello.payload,
+            json!({"client_id": ID, "capabilities": ["pool_redirect_v1"]})
+        );
+        self.reply(&hello, "ack", json!({"server": "legacy-or-pod"}))
+            .await;
     }
 
     async fn membership(&mut self, pool: &str, auth: Option<&str>) -> Message {
@@ -86,14 +104,18 @@ impl Peer {
         assert_eq!(join.kind, "join_pool");
         assert_eq!(join.client_id.as_deref(), Some(ID));
         assert_eq!(join.pool.as_deref(), Some(pool));
-        assert_eq!(join.payload, json!({"client_id": ID, "pool": pool, "auth_token": auth}));
+        assert_eq!(
+            join.payload,
+            json!({"client_id": ID, "pool": pool, "auth_token": auth})
+        );
         join
     }
 
     async fn joined(&mut self, pool: &str, auth: Option<&str>) {
         self.hello().await;
         let join = self.membership(pool, auth).await;
-        self.reply(&join, "ack", json!({"pool": pool, "clients": [ID]})).await;
+        self.reply(&join, "ack", json!({"pool": pool, "clients": [ID]}))
+            .await;
     }
 
     async fn closed(&mut self) {
@@ -114,34 +136,46 @@ fn response(request: &Message, kind: &str, payload: Value) -> Message {
 }
 
 fn redirect(request: &Message, port: u16, pool: &str) -> Message {
-    response(request, "redirect", json!({
-        "protocol": "pool_redirect_v1", "host": "127.0.0.1", "port": port,
-        "ws_port": null, "pool": pool, "pod_index": 1, "pod_count": 4,
-        "router_host": "127.0.0.1", "router_port": 12345,
-        "router_ws_port": null, "cluster_id": "ephemeral-test-cluster",
-    }))
+    response(
+        request,
+        "redirect",
+        json!({
+            "protocol": "pool_redirect_v1", "host": "127.0.0.1", "port": port,
+            "ws_port": null, "pool": pool, "pod_index": 1, "pod_count": 4,
+            "router_host": "127.0.0.1", "router_port": 12345,
+            "router_ws_port": null, "cluster_id": "ephemeral-test-cluster",
+        }),
+    )
 }
 
 fn presence(pool: &str, marker: &str) -> Message {
     Message {
-        kind: "presence_update".to_owned(), request_id: None,
-        client_id: Some(marker.to_owned()), pool: Some(pool.to_owned()),
+        kind: "presence_update".to_owned(),
+        request_id: None,
+        client_id: Some(marker.to_owned()),
+        pool: Some(pool.to_owned()),
         payload: json!({"client_id": marker, "status": "joined", "pool": pool, "clients": [ID]}),
     }
 }
 
 fn invocation(pool: &str, id: &str, event: &str) -> Message {
     Message {
-        kind: "call_app".to_owned(), request_id: Some(id.to_owned()),
-        client_id: Some("caller".to_owned()), pool: Some(pool.to_owned()),
+        kind: "call_app".to_owned(),
+        request_id: Some(id.to_owned()),
+        client_id: Some("caller".to_owned()),
+        pool: Some(pool.to_owned()),
         payload: json!({"event": event, "data": {}, "response_to": "caller"}),
     }
 }
 
-async fn listener() -> TcpListener { TcpListener::bind("127.0.0.1:0").await.unwrap() }
+async fn listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0").await.unwrap()
+}
 
 fn builder(port: u16) -> ClientBuilder {
-    Client::builder(format!("latzero://{ID}"), POOL).port(port).timeout(Duration::from_secs(2))
+    Client::builder(format!("latzero://{ID}"), POOL)
+        .port(port)
+        .timeout(Duration::from_secs(2))
 }
 
 async fn pair(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -> (Client, Peer) {
@@ -153,47 +187,57 @@ async fn pair(configure: impl FnOnce(ClientBuilder) -> ClientBuilder) -> (Client
             peer.joined(POOL, None).await;
             peer
         })
-    }).await;
+    })
+    .await;
     (client.unwrap(), peer)
 }
 
 async fn request_for<F, T>(peer: &mut Peer, future: &mut Pin<Box<F>>) -> Message
-where F: Future<Output = latzero::Result<T>>, T: Debug {
+where
+    F: Future<Output = latzero::Result<T>>,
+    T: Debug,
+{
     bounded(async {
         tokio::select! {
             result = future.as_mut() => panic!("request completed before reply: {result:?}"),
             message = peer.application() => message,
         }
-    }).await
+    })
+    .await
 }
 
 async fn next_connect<F: Future<Output = latzero::Result<Client>>>(
-    peer: &mut Peer, future: &mut Pin<Box<F>>,
+    peer: &mut Peer,
+    future: &mut Pin<Box<F>>,
 ) -> Message {
     bounded(async {
         tokio::select! {
             _ = future.as_mut() => panic!("connect completed before handshake reply"),
             message = peer.read() => message,
         }
-    }).await
+    })
+    .await
 }
 
 async fn accept_connect<F: Future<Output = latzero::Result<Client>>>(
-    listener: &TcpListener, future: &mut Pin<Box<F>>,
+    listener: &TcpListener,
+    future: &mut Pin<Box<F>>,
 ) -> Peer {
     bounded(async {
         tokio::select! {
             _ = future.as_mut() => panic!("connect completed before owner connection"),
             peer = Peer::accept(listener) => peer,
         }
-    }).await
+    })
+    .await
 }
 
 async fn poll_pending<F: Future>(mut future: Pin<&mut F>) {
     poll_fn(|cx| {
         assert!(future.as_mut().poll(cx).is_pending());
         Poll::Ready(())
-    }).await;
+    })
+    .await;
 }
 
 async fn finish(client: Client, mut peer: Peer) {
@@ -211,17 +255,21 @@ async fn redirected_pair() -> (Client, Peer, u16) {
     let entry_port = router.local_addr().unwrap().port();
     let owner_port = owner.local_addr().unwrap().port();
     let (result, peer) = bounded(async {
-        tokio::join!(builder(entry_port).auth_token("initial-token").connect(), async {
-            let mut router = Peer::accept(&router).await;
-            router.hello().await;
-            let join = router.membership(POOL, Some("initial-token")).await;
-            router.send(&redirect(&join, owner_port, POOL)).await;
-            router.closed().await;
-            let mut peer = Peer::accept(&owner).await;
-            peer.joined(POOL, Some("initial-token")).await;
-            peer
-        })
-    }).await;
+        tokio::join!(
+            builder(entry_port).auth_token("initial-token").connect(),
+            async {
+                let mut router = Peer::accept(&router).await;
+                router.hello().await;
+                let join = router.membership(POOL, Some("initial-token")).await;
+                router.send(&redirect(&join, owner_port, POOL)).await;
+                router.closed().await;
+                let mut peer = Peer::accept(&owner).await;
+                peer.joined(POOL, Some("initial-token")).await;
+                peer
+            }
+        )
+    })
+    .await;
     (result.unwrap(), peer, entry_port)
 }
 
@@ -232,7 +280,9 @@ async fn router_owner_handshake_preserves_identity_auth_and_final_buffered_push(
     assert_eq!(client.pool_name().await, POOL);
     let mut events = client.events();
     owner.send(&presence(POOL, "owner-ready")).await;
-    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "owner-ready"));
+    assert!(
+        matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "owner-ready")
+    );
     let mut get = Box::pin(client.get::<Value>("only-on-owner"));
     let request = request_for(&mut owner, &mut get).await;
     assert_eq!(request.kind, "get_buffer");
@@ -251,26 +301,38 @@ async fn final_join_ack_and_following_push_in_one_write_keep_buffered_input() {
             let mut peer = Peer::accept(&owner).await;
             peer.hello().await;
             let join = peer.membership(POOL, None).await;
-            let mut bytes = serde_json::to_vec(&response(&join, "ack", json!({"pool": POOL}))).unwrap();
+            let mut bytes =
+                serde_json::to_vec(&response(&join, "ack", json!({"pool": POOL}))).unwrap();
             bytes.push(b'\n');
             bytes.extend(serde_json::to_vec(&presence(POOL, "buffered-after-join")).unwrap());
             bytes.push(b'\n');
             bounded(peer.writer.write_all(&bytes)).await.unwrap();
             peer
         })
-    }).await;
+    })
+    .await;
     let client = client.unwrap();
     let mut events = client.events();
-    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "buffered-after-join"));
+    assert!(
+        matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "buffered-after-join")
+    );
     finish(client, peer).await;
 }
 
 async fn hop_chain(redirects: usize, limit: Option<usize>) {
     let mut listeners = Vec::new();
-    for _ in 0..=redirects { listeners.push(listener().await); }
-    let ports: Vec<_> = listeners.iter().map(|listener| listener.local_addr().unwrap().port()).collect();
+    for _ in 0..=redirects {
+        listeners.push(listener().await);
+    }
+    let ports: Vec<_> = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
     let maximum = limit.unwrap_or(4);
-    let builder = limit.map_or_else(|| builder(ports[0]), |limit| builder(ports[0]).max_redirects(limit));
+    let builder = limit.map_or_else(
+        || builder(ports[0]),
+        |limit| builder(ports[0]).max_redirects(limit),
+    );
     let (result, peer) = bounded(async {
         tokio::join!(builder.connect(), async {
             for index in 0..=redirects.min(maximum) {
@@ -286,7 +348,8 @@ async fn hop_chain(redirects: usize, limit: Option<usize>) {
             }
             None
         })
-    }).await;
+    })
+    .await;
     if redirects <= maximum {
         finish(result.unwrap(), peer.unwrap()).await;
     } else {
@@ -299,7 +362,14 @@ async fn hop_chain(redirects: usize, limit: Option<usize>) {
 
 #[tokio::test]
 async fn default_four_hops_and_explicit_redirect_limits_are_bounded() {
-    for (hops, limit) in [(4, None), (5, None), (2, Some(2)), (3, Some(2)), (1, Some(0)), (5, Some(5))] {
+    for (hops, limit) in [
+        (4, None),
+        (5, None),
+        (2, Some(2)),
+        (3, Some(2)),
+        (1, Some(0)),
+        (5, Some(5)),
+    ] {
         hop_chain(hops, limit).await;
     }
 }
@@ -307,19 +377,34 @@ async fn default_four_hops_and_explicit_redirect_limits_are_bounded() {
 #[tokio::test]
 async fn unsafe_malformed_redirect_fields_fail_before_target_connection() {
     for (field, value) in [
-        ("protocol", json!("other")), ("pool", json!("beta")),
-        ("host", json!("localhost")), ("host", json!("example.invalid")),
-        ("host", json!("192.0.2.1")), ("host", json!("0.0.0.0")),
-        ("host", json!("::ffff:127.0.0.1")), ("host", json!("127.1")),
-        ("port", json!(0)), ("port", json!(65536)), ("port", json!(-1)),
-        ("port", json!(true)), ("port", json!(123.0)), ("port", json!("123")),
-        ("ws_port", json!(0)), ("router_port", json!(0)),
-        ("router_ws_port", json!(false)), ("router_host", json!("remote.invalid")),
-        ("pod_index", json!(-1)), ("pod_index", json!(4)),
-        ("pod_index", json!(0.0)), ("pod_index", json!(false)),
-        ("pod_count", json!(0)), ("pod_count", json!(65)),
-        ("pod_count", json!(4.0)), ("pod_count", json!(true)),
-        ("cluster_id", json!("")), ("cluster_id", Value::Null),
+        ("protocol", json!("other")),
+        ("pool", json!("beta")),
+        ("host", json!("localhost")),
+        ("host", json!("example.invalid")),
+        ("host", json!("192.0.2.1")),
+        ("host", json!("0.0.0.0")),
+        ("host", json!("::ffff:127.0.0.1")),
+        ("host", json!("127.1")),
+        ("port", json!(0)),
+        ("port", json!(65536)),
+        ("port", json!(-1)),
+        ("port", json!(true)),
+        ("port", json!(123.0)),
+        ("port", json!("123")),
+        ("ws_port", json!(0)),
+        ("router_port", json!(0)),
+        ("router_ws_port", json!(false)),
+        ("router_host", json!("remote.invalid")),
+        ("pod_index", json!(-1)),
+        ("pod_index", json!(4)),
+        ("pod_index", json!(0.0)),
+        ("pod_index", json!(false)),
+        ("pod_count", json!(0)),
+        ("pod_count", json!(65)),
+        ("pod_count", json!(4.0)),
+        ("pod_count", json!(true)),
+        ("cluster_id", json!("")),
+        ("cluster_id", Value::Null),
     ] {
         let router = listener().await;
         let owner = listener().await;
@@ -335,8 +420,12 @@ async fn unsafe_malformed_redirect_fields_fail_before_target_connection() {
                 peer.send(&redirect).await;
                 peer.closed().await;
             })
-        }).await;
-        assert!(matches!(result, Err(Error::Protocol(_))), "accepted invalid field {field}");
+        })
+        .await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "accepted invalid field {field}"
+        );
         let mut accept = Box::pin(owner.accept());
         poll_pending(accept.as_mut()).await;
     }
@@ -355,12 +444,16 @@ async fn redirect_envelope_requires_requested_client_and_pool() {
                 peer.hello().await;
                 let join = peer.membership(POOL, None).await;
                 let mut redirect = redirect(&join, owner_port, POOL);
-                if wrong_client { redirect.client_id = Some("other".to_owned()); }
-                else { redirect.pool = Some("other".to_owned()); }
+                if wrong_client {
+                    redirect.client_id = Some("other".to_owned());
+                } else {
+                    redirect.pool = Some("other".to_owned());
+                }
                 peer.send(&redirect).await;
                 peer.closed().await;
             })
-        }).await;
+        })
+        .await;
         assert!(matches!(result, Err(Error::Protocol(_))));
         let mut accept = Box::pin(owner.accept());
         poll_pending(accept.as_mut()).await;
@@ -379,7 +472,12 @@ async fn localhost_alias_and_two_endpoint_cycles_are_rejected_without_reconnect(
                 let mut peer = Peer::accept(&first).await;
                 peer.hello().await;
                 let join = peer.membership(POOL, None).await;
-                peer.send(&redirect(&join, if two_hops { second_port } else { first_port }, POOL)).await;
+                peer.send(&redirect(
+                    &join,
+                    if two_hops { second_port } else { first_port },
+                    POOL,
+                ))
+                .await;
                 peer.closed().await;
                 if two_hops {
                     let mut peer = Peer::accept(&second).await;
@@ -389,7 +487,8 @@ async fn localhost_alias_and_two_endpoint_cycles_are_rejected_without_reconnect(
                     peer.closed().await;
                 }
             })
-        }).await;
+        })
+        .await;
         assert!(matches!(result, Err(Error::Protocol(message)) if message.contains("cycle")));
         let mut accept = Box::pin(first.accept());
         poll_pending(accept.as_mut()).await;
@@ -420,7 +519,8 @@ async fn ownership_metadata_changes_within_chain_are_not_authentication() {
                 peer.send(&redirect).await;
                 peer.closed().await;
             })
-        }).await;
+        })
+        .await;
         assert!(matches!(result, Err(Error::Protocol(_))));
         let mut accept = Box::pin(target.accept());
         poll_pending(accept.as_mut()).await;
@@ -446,7 +546,8 @@ async fn hello_and_uncorrelated_membership_redirects_do_not_move_transport() {
             peer.reply(&join, "ack", json!({"pool": POOL})).await;
             peer
         })
-    }).await;
+    })
+    .await;
     let mut accept = Box::pin(owner.accept());
     poll_pending(accept.as_mut()).await;
     finish(client.unwrap(), peer).await;
@@ -459,14 +560,21 @@ async fn rpc_and_unsolicited_redirects_never_replay_or_replace_transport() {
     let owner_port = owner.local_addr().unwrap().port();
     let mut events = client.events();
     let data = json!({"effect": "once"});
-    let mut call = Box::pin(client.call_app_with_options::<_, Value>("remote", "effect", &data, WAIT, None));
+    let mut call =
+        Box::pin(client.call_app_with_options::<_, Value>("remote", "effect", &data, WAIT, None));
     let request = request_for(&mut peer, &mut call).await;
     peer.send(&redirect(&request, owner_port, POOL)).await;
     peer.send(&presence(POOL, "processed-redirect")).await;
-    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Unknown(message) if message.kind == "redirect"));
-    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(_)));
+    assert!(
+        matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Unknown(message) if message.kind == "redirect")
+    );
+    assert!(matches!(
+        bounded(events.recv()).await.unwrap(),
+        ClientEvent::Presence(_)
+    ));
     poll_pending(call.as_mut()).await;
-    peer.reply(&request, "app_result", json!({"value": 42, "error": null})).await;
+    peer.reply(&request, "app_result", json!({"value": 42, "error": null}))
+        .await;
     assert_eq!(bounded(call).await.unwrap(), CallOutcome::Result(json!(42)));
     let mut accept = Box::pin(owner.accept());
     poll_pending(accept.as_mut()).await;
@@ -485,14 +593,20 @@ async fn redirect_hops_share_the_original_connect_deadline() {
     let hello = next_connect(&mut first, &mut connect).await;
     first.reply(&hello, "ack", json!({})).await;
     let join = next_connect(&mut first, &mut connect).await;
-    assert!(time::timeout_at(started + Duration::from_millis(450), connect.as_mut()).await.is_err());
+    assert!(
+        time::timeout_at(started + Duration::from_millis(450), connect.as_mut())
+            .await
+            .is_err()
+    );
     first.send(&redirect(&join, owner_port, POOL)).await;
     let mut target = accept_connect(&owner, &mut connect).await;
     let hello = next_connect(&mut target, &mut connect).await;
     target.reply(&hello, "ack", json!({})).await;
     let join = next_connect(&mut target, &mut connect).await;
     assert_eq!(join.kind, "join_pool");
-    let result = time::timeout_at(started + Duration::from_millis(950), connect).await.expect("deadline reset at redirect");
+    let result = time::timeout_at(started + Duration::from_millis(950), connect)
+        .await
+        .expect("deadline reset at redirect");
     assert!(matches!(result, Err(Error::Timeout { .. })));
     first.closed().await;
     target.closed().await;
@@ -506,19 +620,26 @@ async fn switch_handoff_hello_join_share_the_original_switch_deadline() {
     let started = time::Instant::now();
     let mut switch = Box::pin(client.switch_pool("beta", None));
     let request = request_for(&mut old, &mut switch).await;
-    assert!(time::timeout_at(started + Duration::from_millis(450), switch.as_mut()).await.is_err());
+    assert!(
+        time::timeout_at(started + Duration::from_millis(450), switch.as_mut())
+            .await
+            .is_err()
+    );
     old.send(&redirect(&request, port, "beta")).await;
     let mut target = bounded(async {
         tokio::select! {
             _ = switch.as_mut() => panic!("switch ended before owner"),
             peer = Peer::accept(&owner) => peer,
         }
-    }).await;
+    })
+    .await;
     let hello = request_for(&mut target, &mut switch).await;
     target.reply(&hello, "ack", json!({})).await;
     let join = request_for(&mut target, &mut switch).await;
     assert_eq!(join.kind, "join_pool");
-    let result = time::timeout_at(started + Duration::from_millis(950), switch).await.expect("switch reset the redirect deadline");
+    let result = time::timeout_at(started + Duration::from_millis(950), switch)
+        .await
+        .expect("switch reset the redirect deadline");
     assert!(matches!(result, Err(Error::Timeout { .. })));
     assert!(!client.is_connected());
     old.closed().await;
@@ -528,7 +649,8 @@ async fn switch_handoff_hello_join_share_the_original_switch_deadline() {
 #[tokio::test]
 async fn rejected_switch_redirect_closes_uncertain_old_membership_without_target_connect() {
     for invalid in ["disabled", "zero-port", "cycle", "wrong-pool"] {
-        let (client, mut old) = pair(|builder| builder.max_redirects(if invalid == "disabled" { 0 } else { 4 })).await;
+        let (client, mut old) =
+            pair(|builder| builder.max_redirects(if invalid == "disabled" { 0 } else { 4 })).await;
         let clone = client.clone();
         let owner = listener().await;
         let owner_port = owner.local_addr().unwrap().port();
@@ -546,7 +668,10 @@ async fn rejected_switch_redirect_closes_uncertain_old_membership_without_target
         assert!(matches!(bounded(switch).await, Err(Error::Protocol(_))));
         assert!(!client.is_connected() && !clone.is_connected());
         assert_eq!(clone.pool_name().await, POOL);
-        assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Disconnected));
+        assert!(matches!(
+            bounded(events.recv()).await.unwrap(),
+            ClientEvent::Disconnected
+        ));
         old.closed().await;
         let mut accept = Box::pin(owner.accept());
         poll_pending(accept.as_mut()).await;
@@ -554,7 +679,11 @@ async fn rejected_switch_redirect_closes_uncertain_old_membership_without_target
 }
 
 struct Dropped(mpsc::UnboundedSender<()>);
-impl Drop for Dropped { fn drop(&mut self) { let _ = self.0.send(()); } }
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
 
 #[tokio::test]
 async fn switch_updates_all_clones_and_event_api_without_old_reply_or_rpc_replay() {
@@ -566,21 +695,24 @@ async fn switch_updates_all_clones_and_event_api_without_old_reply_or_rpc_replay
     let (dropped_tx, mut dropped) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));
     let handler_release = release.clone();
-    client.on_event("held", move |_| {
-        let started = started_tx.clone();
-        let dropped = dropped_tx.clone();
-        let release = handler_release.clone();
-        async move {
-            let _guard = Dropped(dropped);
-            started.send(()).unwrap();
-            release.acquire().await.unwrap().forget();
-            Ok::<_, String>("old-result")
-        }
-    }).await;
+    client
+        .on_event("held", move |_| {
+            let started = started_tx.clone();
+            let dropped = dropped_tx.clone();
+            let release = handler_release.clone();
+            async move {
+                let _guard = Dropped(dropped);
+                started.send(()).unwrap();
+                release.acquire().await.unwrap().forget();
+                Ok::<_, String>("old-result")
+            }
+        })
+        .await;
     old.send(&invocation(POOL, "old-opaque-hop", "held")).await;
     assert_eq!(bounded(started.recv()).await, Some(()));
     let data = json!({});
-    let mut pending = Box::pin(clone.call_app_with_options::<_, Value>("remote", "effect", &data, WAIT, None));
+    let mut pending =
+        Box::pin(clone.call_app_with_options::<_, Value>("remote", "effect", &data, WAIT, None));
     let effect = request_for(&mut old, &mut pending).await;
     old.reply(&effect, "ack", json!({"queued": true})).await;
     let owner = listener().await;
@@ -597,8 +729,10 @@ async fn switch_updates_all_clones_and_event_api_without_old_reply_or_rpc_replay
             _ = switch.as_mut() => panic!("switch completed before owner join"),
             target = Peer::accept(&owner) => target,
         }
-    }).await;
-    let (result, ()) = bounded(async { tokio::join!(switch, target.joined("beta", Some("new-token"))) }).await;
+    })
+    .await;
+    let (result, ()) =
+        bounded(async { tokio::join!(switch, target.joined("beta", Some("new-token"))) }).await;
     result.unwrap();
     old.closed().await;
     assert!(matches!(bounded(pending).await, Err(Error::Disconnected)));
@@ -607,13 +741,20 @@ async fn switch_updates_all_clones_and_event_api_without_old_reply_or_rpc_replay
     assert_eq!(clone.pool_name().await, "beta");
     release.add_permits(1);
     target.send(&presence("beta", "new-generation")).await;
-    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.pool == "beta"));
+    assert!(
+        matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.pool == "beta")
+    );
     let mut get = Box::pin(namespace.get::<Value>("fence"));
     let request = request_for(&mut target, &mut get).await;
-    assert_eq!(request.kind, "get_buffer", "old result or effect replay escaped to owner");
+    assert_eq!(
+        request.kind, "get_buffer",
+        "old result or effect replay escaped to owner"
+    );
     assert_eq!(request.payload["key"], "shared:fence");
     assert_eq!(request.pool.as_deref(), Some("beta"));
-    target.reply(&request, "ack", json!({"exists": false})).await;
+    target
+        .reply(&request, "ack", json!({"exists": false}))
+        .await;
     assert_eq!(bounded(get).await.unwrap(), None);
     drop(namespace);
     drop(clone);
@@ -623,21 +764,36 @@ async fn switch_updates_all_clones_and_event_api_without_old_reply_or_rpc_replay
 #[tokio::test]
 async fn same_pool_owner_rejoin_retains_process_handler_and_pending_route() {
     let (client, mut peer, _) = redirected_pair().await;
-    let mut register = Box::pin(client.register_process("job", ProcessOptions::default(), |_| async { Ok::<_, String>("retained") }));
+    let mut register = Box::pin(client.register_process(
+        "job",
+        ProcessOptions::default(),
+        |_| async { Ok::<_, String>("retained") },
+    ));
     let request = request_for(&mut peer, &mut register).await;
-    peer.reply(&request, "ack", json!({"process_id": format!("{ID}:job")})).await;
+    peer.reply(&request, "ack", json!({"process_id": format!("{ID}:job")}))
+        .await;
     bounded(register).await.unwrap();
     let data = json!({});
-    let mut pending = Box::pin(client.call_app_with_options::<_, Value>("remote", "held", &data, WAIT, None));
+    let mut pending =
+        Box::pin(client.call_app_with_options::<_, Value>("remote", "held", &data, WAIT, None));
     let call = request_for(&mut peer, &mut pending).await;
     peer.reply(&call, "ack", json!({"queued": true})).await;
     let mut switch = Box::pin(client.switch_pool(POOL, Some("same-pool-token")));
     let request = request_for(&mut peer, &mut switch).await;
     peer.reply(&request, "ack", json!({"pool": POOL})).await;
     bounded(switch).await.unwrap();
-    peer.reply(&call, "app_result", json!({"value": 7, "error": null})).await;
-    assert_eq!(bounded(pending).await.unwrap(), CallOutcome::Result(json!(7)));
-    peer.send(&invocation(POOL, "retained-opaque-hop", &format!("{ID}:job"))).await;
+    peer.reply(&call, "app_result", json!({"value": 7, "error": null}))
+        .await;
+    assert_eq!(
+        bounded(pending).await.unwrap(),
+        CallOutcome::Result(json!(7))
+    );
+    peer.send(&invocation(
+        POOL,
+        "retained-opaque-hop",
+        &format!("{ID}:job"),
+    ))
+    .await;
     let result = peer.application().await;
     assert_eq!(result.kind, "app_result");
     assert_eq!(result.request_id.as_deref(), Some("retained-opaque-hop"));
@@ -662,15 +818,29 @@ async fn final_owner_authentication_denial_is_typed_and_switch_closes_uncertain_
                     let mut peer = Peer::accept(&owner).await;
                     peer.hello().await;
                     let join = peer.membership("secure", Some("denied")).await;
-                    peer.reply(&join, "error", json!({"code": "auth_failed", "message": "bad pool token"})).await;
+                    peer.reply(
+                        &join,
+                        "error",
+                        json!({"code": "auth_failed", "message": "bad pool token"}),
+                    )
+                    .await;
                     peer.closed().await;
                 })
-            }).await;
-            assert!(matches!(result, Err(Error::Authentication(message)) if message == "bad pool token"));
+            })
+            .await;
+            assert!(
+                matches!(result, Err(Error::Authentication(message)) if message == "bad pool token")
+            );
             assert!(!client.is_connected() && !clone.is_connected());
             assert_eq!(clone.pool_name().await, POOL);
-            assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Disconnected));
-            assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+            assert!(matches!(
+                bounded(events.recv()).await.unwrap(),
+                ClientEvent::Disconnected
+            ));
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
             old.closed().await;
         } else {
             let router = listener().await;
@@ -685,10 +855,16 @@ async fn final_owner_authentication_denial_is_typed_and_switch_closes_uncertain_
                     let mut peer = Peer::accept(&owner).await;
                     peer.hello().await;
                     let join = peer.membership(POOL, Some("denied")).await;
-                    peer.reply(&join, "error", json!({"code": "auth_failed", "message": "denied"})).await;
+                    peer.reply(
+                        &join,
+                        "error",
+                        json!({"code": "auth_failed", "message": "denied"}),
+                    )
+                    .await;
                     peer.closed().await;
                 })
-            }).await;
+            })
+            .await;
             assert!(matches!(result, Err(Error::Authentication(_))));
         }
     }
@@ -736,7 +912,8 @@ async fn cancelling_switch_at_owner_hello_or_join_closes_every_clone_and_transpo
                 _ = switch.as_mut() => panic!("switch ended before owner"),
                 peer = Peer::accept(&owner) => peer,
             }
-        }).await;
+        })
+        .await;
         let hello = request_for(&mut target, &mut switch).await;
         assert_eq!(hello.kind, "hello");
         if during_join {
@@ -746,10 +923,38 @@ async fn cancelling_switch_at_owner_hello_or_join_closes_every_clone_and_transpo
         }
         drop(switch);
         assert!(!client.is_connected() && !clone.is_connected());
-        assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Disconnected));
+        assert!(matches!(
+            bounded(events.recv()).await.unwrap(),
+            ClientEvent::Disconnected
+        ));
         old.closed().await;
         target.closed().await;
         assert!(matches!(clone.clients().await, Err(Error::Disconnected)));
+    }
+}
+
+#[tokio::test]
+async fn cancelling_retired_router_handoff_before_owner_dial_closes_shared_state() {
+    for pool in [POOL, "beta"] {
+        let (client, mut old) = pair(|builder| builder).await;
+        let clone = client.clone();
+        let owner = listener().await;
+        let port = owner.local_addr().unwrap().port();
+        let mut events = clone.events();
+        let mut switch = Box::pin(client.switch_pool(pool, None));
+        let request = request_for(&mut old, &mut switch).await;
+        old.send(&redirect(&request, port, pool)).await;
+        // Retirement closes the old socket even when the switch future stays
+        // unpolled at its membership waiter, before any owner dial.
+        old.closed().await;
+        drop(switch);
+        assert!(!client.is_connected() && !clone.is_connected());
+        assert!(matches!(
+            bounded(events.recv()).await.unwrap(),
+            ClientEvent::Disconnected
+        ));
+        let mut accept = Box::pin(owner.accept());
+        poll_pending(accept.as_mut()).await;
     }
 }
 
@@ -759,22 +964,26 @@ async fn redirected_connection_lives_until_last_public_clone_and_cancels_interna
     let clone = client.clone();
     let (started_tx, mut started) = mpsc::unbounded_channel();
     let (dropped_tx, mut dropped) = mpsc::unbounded_channel();
-    client.on_event("never", move |_| {
-        let started = started_tx.clone();
-        let dropped = dropped_tx.clone();
-        async move {
-            let _guard = Dropped(dropped);
-            started.send(()).unwrap();
-            std::future::pending::<()>().await;
-            Ok::<_, String>(Value::Null)
-        }
-    }).await;
+    client
+        .on_event("never", move |_| {
+            let started = started_tx.clone();
+            let dropped = dropped_tx.clone();
+            async move {
+                let _guard = Dropped(dropped);
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+                Ok::<_, String>(Value::Null)
+            }
+        })
+        .await;
     drop(client);
     let mut operation = Box::pin(clone.clients());
     let request = request_for(&mut owner, &mut operation).await;
     owner.reply(&request, "ack", json!({"clients": [ID]})).await;
     assert_eq!(bounded(operation).await.unwrap(), [ID]);
-    owner.send(&invocation(POOL, "last-public-handle", "never")).await;
+    owner
+        .send(&invocation(POOL, "last-public-handle", "never"))
+        .await;
     assert_eq!(bounded(started.recv()).await, Some(()));
     drop(clone);
     assert_eq!(bounded(dropped.recv()).await, Some(()));
@@ -786,14 +995,23 @@ async fn redirected_owner_starts_one_metrics_stream_and_closes_it_on_last_handle
     let (client, mut peer, _) = redirected_pair().await;
     let effects = Arc::new(AtomicUsize::new(0));
     let counter = effects.clone();
-    let mut register = Box::pin(client.register_process("metrics", ProcessOptions::default(), move |_| {
-        counter.fetch_add(1, Ordering::SeqCst);
-        async { Ok::<_, String>(42) }
-    }));
+    let mut register =
+        Box::pin(
+            client.register_process("metrics", ProcessOptions::default(), move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, String>(42) }
+            }),
+        );
     let request = request_for(&mut peer, &mut register).await;
-    peer.reply(&request, "ack", json!({"process_id": format!("{ID}:metrics")})).await;
+    peer.reply(
+        &request,
+        "ack",
+        json!({"process_id": format!("{ID}:metrics")}),
+    )
+    .await;
     bounded(register).await.unwrap();
-    peer.send(&invocation(POOL, "metrics-hop", &format!("{ID}:metrics"))).await;
+    peer.send(&invocation(POOL, "metrics-hop", &format!("{ID}:metrics")))
+        .await;
     assert_eq!(peer.application().await.payload["value"], 42);
     let metrics = peer.read().await;
     assert_eq!(metrics.kind, "worker_metrics");

@@ -278,7 +278,9 @@ impl ClientBuilder {
             }
         }
         if self.max_redirects > 16 {
-            return Err(Error::Protocol("max_redirects must be between 0 and 16".to_owned()));
+            return Err(Error::Protocol(
+                "max_redirects must be between 0 and 16".to_owned(),
+            ));
         }
         deadline(self.write_timeout)?;
         deadline(self.shutdown_timeout)?;
@@ -667,7 +669,9 @@ impl RedirectChain {
             .as_ref()
             .is_some_and(|(known, pods)| known != cluster || *pods != count)
         {
-            return Err(invalid("cluster or pod count changed within redirect chain"));
+            return Err(invalid(
+                "cluster or pod count changed within redirect chain",
+            ));
         }
         if self.redirects >= self.limit {
             return Err(invalid("redirect limit exceeded"));
@@ -695,7 +699,11 @@ fn redirect_port(payload: &Value, name: &str, optional: bool) -> Result<Option<u
         .and_then(|port| u16::try_from(port).ok())
         .filter(|port| *port != 0)
         .map(Some)
-        .ok_or_else(|| Error::Protocol(format!("invalid pool redirect: {name} must be a nonzero u16")))
+        .ok_or_else(|| {
+            Error::Protocol(format!(
+                "invalid pool redirect: {name} must be a nonzero u16"
+            ))
+        })
 }
 
 async fn open_pool_connection(
@@ -732,14 +740,23 @@ async fn open_pool_connection(
                 TcpStream::connect(&address).await
             }
         };
-        let stream = match time::timeout_at(options.deadline.into(), connect).await
-        {
+        let stream = match time::timeout_at(options.deadline.into(), connect).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(source)) => return Err(Error::Connection { endpoint: address, source }),
-            Err(_) => return Err(Error::Connection {
-                endpoint: address,
-                source: std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"),
-            }),
+            Ok(Err(source)) => {
+                return Err(Error::Connection {
+                    endpoint: address,
+                    source,
+                });
+            }
+            Err(_) => {
+                return Err(Error::Connection {
+                    endpoint: address,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connection timed out",
+                    ),
+                });
+            }
         };
         let peer_addr = stream.peer_addr()?;
         chain.visited.insert(peer_addr);
@@ -770,7 +787,12 @@ async fn open_pool_connection(
             drop(writer);
             continue;
         }
-        return Ok(PreparedConnection { endpoint, peer_addr, reader, writer });
+        return Ok(PreparedConnection {
+            endpoint,
+            peer_addr,
+            reader,
+            writer,
+        });
     }
 }
 
@@ -786,11 +808,16 @@ async fn handshake_request(
     }
     let mut encoded = serde_json::to_vec(request)?;
     if encoded.len() > options.max_frame_bytes {
-        return Err(Error::FrameTooLarge { size: encoded.len(), limit: options.max_frame_bytes });
+        return Err(Error::FrameTooLarge {
+            size: encoded.len(),
+            limit: options.max_frame_bytes,
+        });
     }
     encoded.push(b'\n');
     if encoded.len() > options.max_queued_bytes {
-        return Err(Error::Overloaded { resource: "writer bytes" });
+        return Err(Error::Overloaded {
+            resource: "writer bytes",
+        });
     }
     let write_deadline = options.deadline.min(deadline(options.write_timeout)?);
     time::timeout_at(write_deadline.into(), writer.write_all(&encoded))
@@ -800,10 +827,13 @@ async fn handshake_request(
         if Instant::now() >= options.deadline {
             return Err(request_timeout(request_id, options.timeout));
         }
-        let frame = time::timeout_at(options.deadline.into(), read_frame(reader, options.max_frame_bytes))
-            .await
-            .map_err(|_| request_timeout(request_id, options.timeout))??
-            .ok_or(Error::Disconnected)?;
+        let frame = time::timeout_at(
+            options.deadline.into(),
+            read_frame(reader, options.max_frame_bytes),
+        )
+        .await
+        .map_err(|_| request_timeout(request_id, options.timeout))??
+        .ok_or(Error::Disconnected)?;
         let message: Message = serde_json::from_slice(&frame)?;
         if message.kind.is_empty() || !(message.payload.is_object() || message.payload.is_null()) {
             return Err(Error::Protocol("invalid handshake envelope".to_owned()));
@@ -973,7 +1003,9 @@ impl Client {
 
     async fn force_close(&self) {
         self.inner.close();
-        let _ = self.cancel_handlers(Instant::now() + self.inner.shutdown_timeout).await;
+        let _ = self
+            .cancel_handlers(Instant::now() + self.inner.shutdown_timeout)
+            .await;
         for stored in [
             &self.inner.metrics_task,
             &self.inner.writer_task,
@@ -1028,7 +1060,9 @@ impl Client {
         let mut reader_task = lock(&self.inner.reader_task);
         let mut writer_task = lock(&self.inner.writer_task);
         if reader_task.is_some() || writer_task.is_some() {
-            return Err(Error::Protocol("old transport tasks were not reaped".to_owned()));
+            return Err(Error::Protocol(
+                "old transport tasks were not reaped".to_owned(),
+            ));
         }
         let changed = pool != *lock(&self.inner.pool);
         *lock(&self.inner.pool) = pool.to_owned();
@@ -2362,9 +2396,7 @@ impl Client {
             sent = self.send_message(&response, deadline, generation, None, true);
         }
         if let Err(error) = sent {
-            if generation != self.inner.generation.load(Ordering::Acquire)
-                || !self.is_connected()
-            {
+            if generation != self.inner.generation.load(Ordering::Acquire) || !self.is_connected() {
                 return;
             }
             let _ = self.inner.events.send(ClientEvent::HandlerFailed {
@@ -2530,9 +2562,7 @@ async fn read_loop(
         if let Some(sender) = redirect_sender {
             // The router closes this socket. Fence it before EOF or an old
             // writer failure can touch the replacement connection.
-            if state.retire_connection(connection_generation)
-                && sender.try_send(message).is_err()
-            {
+            if state.retire_connection(connection_generation) && sender.try_send(message).is_err() {
                 state.close();
             }
             return;
@@ -2595,9 +2625,14 @@ async fn metrics_loop(inner: Weak<Inner>) {
         if !client.is_connected() {
             return;
         }
-        let Ok(deadline) = deadline(client.inner.timeout) else { return; };
-        let Ok(_admission) = time::timeout_at(deadline.into(), client.inner.operation_gate.read()).await
-        else { continue; };
+        let Ok(deadline) = deadline(client.inner.timeout) else {
+            return;
+        };
+        let Ok(_admission) =
+            time::timeout_at(deadline.into(), client.inner.operation_gate.read()).await
+        else {
+            continue;
+        };
         if !client.is_connected() || client.inner.closing.load(Ordering::Acquire) {
             return;
         }
@@ -2605,12 +2640,14 @@ async fn metrics_loop(inner: Weak<Inner>) {
         if !processes.is_empty() {
             let metrics: Vec<_> = processes.iter().map(|runtime| runtime.metrics()).collect();
             let pool = lock(&client.inner.pool).clone();
-            let _ = client.request_in_pool(
-                MessageType::WorkerMetrics,
-                json!({"metrics": metrics}),
-                Some(pool),
-                deadline.saturating_duration_since(Instant::now()),
-            ).await;
+            let _ = client
+                .request_in_pool(
+                    MessageType::WorkerMetrics,
+                    json!({"metrics": metrics}),
+                    Some(pool),
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .await;
         }
     }
 }
@@ -3162,7 +3199,11 @@ mod tests {
                 Err(Error::Protocol(_))
             ));
         }
-        assert!(RedirectChain::new("localhost", 4).follow(&message, "worker", "alpha").is_ok());
+        assert!(
+            RedirectChain::new("localhost", 4)
+                .follow(&message, "worker", "alpha")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3229,7 +3270,9 @@ mod tests {
         let router_port = router.local_addr().unwrap().port();
         let owner_port = owner.local_addr().unwrap().port();
         let (client, (mut old_reader, mut old_writer)) = tokio::join!(
-            ClientBuilder::new("latzero://worker", "alpha").port(router_port).connect(),
+            ClientBuilder::new("latzero://worker", "alpha")
+                .port(router_port)
+                .connect(),
             async {
                 let (socket, _) = router.accept().await.unwrap();
                 let (reader, mut writer) = socket.into_split();
@@ -3237,7 +3280,13 @@ mod tests {
                 for _ in 0..2 {
                     let frame = read_frame(&mut reader, 4096).await.unwrap().unwrap();
                     let request: Message = serde_json::from_slice(&frame).unwrap();
-                    let ack = Message::new(MessageType::Ack, request.request_id, request.client_id, request.pool, json!({}));
+                    let ack = Message::new(
+                        MessageType::Ack,
+                        request.request_id,
+                        request.client_id,
+                        request.pool,
+                        json!({}),
+                    );
                     let mut bytes = serde_json::to_vec(&ack).unwrap();
                     bytes.push(b'\n');
                     writer.write_all(&bytes).await.unwrap();
@@ -3253,7 +3302,10 @@ mod tests {
         let switched = async {
             client.switch_pool("beta", Some("token")).await.unwrap();
             assert!(Arc::ptr_eq(&original_inner, &client.inner));
-            assert_eq!(lock(&client.inner.metrics_task).as_ref().unwrap().id(), metrics_id);
+            assert_eq!(
+                lock(&client.inner.metrics_task).as_ref().unwrap().id(),
+                metrics_id
+            );
             assert_eq!(client.inner.entry_endpoint.port, router_port);
             assert_eq!(lock(&client.inner.transport).endpoint.port, owner_port);
             assert!(lock(&client.inner.pending).is_empty());
@@ -3261,7 +3313,13 @@ mod tests {
             assert_eq!(client.inner.handler_bytes.load(Ordering::Acquire), 0);
             client.inner.close_connection(old_generation);
             assert!(client.is_connected());
-            client.reply_call("obsolete-hop".to_owned(), "old-event", Ok(json!(42)), old_work_generation, "alpha".to_owned());
+            client.reply_call(
+                "obsolete-hop".to_owned(),
+                "old-event",
+                Ok(json!(42)),
+                old_work_generation,
+                "alpha".to_owned(),
+            );
             assert!(client.is_connected());
             client.clients().await.unwrap();
             client.force_close().await;
@@ -3272,12 +3330,18 @@ mod tests {
         let peer = async {
             let frame = read_frame(&mut old_reader, 4096).await.unwrap().unwrap();
             let request: Message = serde_json::from_slice(&frame).unwrap();
-            let redirect = Message::new(MessageType::Redirect, request.request_id, request.client_id, request.pool, json!({
-                "protocol": REDIRECT_PROTOCOL, "host": "127.0.0.1", "port": owner_port,
-                "pool": "beta", "pod_index": 1, "pod_count": 4,
-                "router_host": "127.0.0.1", "router_port": router_port,
-                "cluster_id": "cluster",
-            }));
+            let redirect = Message::new(
+                MessageType::Redirect,
+                request.request_id,
+                request.client_id,
+                request.pool,
+                json!({
+                    "protocol": REDIRECT_PROTOCOL, "host": "127.0.0.1", "port": owner_port,
+                    "pool": "beta", "pod_index": 1, "pod_count": 4,
+                    "router_host": "127.0.0.1", "router_port": router_port,
+                    "cluster_id": "cluster",
+                }),
+            );
             let mut bytes = serde_json::to_vec(&redirect).unwrap();
             bytes.push(b'\n');
             old_writer.write_all(&bytes).await.unwrap();
@@ -3289,14 +3353,24 @@ mod tests {
                 let frame = read_frame(&mut reader, 4096).await.unwrap().unwrap();
                 let request: Message = serde_json::from_slice(&frame).unwrap();
                 assert_eq!(request.kind, expected);
-                let ack = Message::new(MessageType::Ack, request.request_id, request.client_id, request.pool, json!({"clients": ["worker"]}));
+                let ack = Message::new(
+                    MessageType::Ack,
+                    request.request_id,
+                    request.client_id,
+                    request.pool,
+                    json!({"clients": ["worker"]}),
+                );
                 let mut bytes = serde_json::to_vec(&ack).unwrap();
                 bytes.push(b'\n');
                 writer.write_all(&bytes).await.unwrap();
             }
             assert!(read_frame(&mut reader, 4096).await.unwrap().is_none());
         };
-        time::timeout(Duration::from_secs(4), async { tokio::join!(switched, peer); }).await.unwrap();
+        time::timeout(Duration::from_secs(4), async {
+            tokio::join!(switched, peer);
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

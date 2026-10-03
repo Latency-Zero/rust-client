@@ -24,6 +24,7 @@ shared-memory mode is Python-specific and is not implemented by this crate.
 - Third-party response routing
 - Namespaced buffers and event emitters
 - Concurrent request correlation and typed errors
+- Bounded local pool-owner redirects for explicit server pod mode
 - Automatic transport cleanup when the final client handle is dropped
 
 ## Requirements
@@ -123,6 +124,7 @@ let client = Client::builder("latzero://worker-1", "production")
     .port(14_130)
     .auth_token("optional-pool-token")
     .timeout(Duration::from_secs(10))
+    .max_redirects(4)
     .event_capacity(512)
     .connect()
     .await?;
@@ -130,8 +132,8 @@ let client = Client::builder("latzero://worker-1", "production")
 # }
 ```
 
-An established client can move to another pool with `switch_pool`. Registered
-processes are cleared when switching pools and must be registered again.
+An established client can move to another pool with `switch_pool`. Changing
+pools clears registered processes; register them again in the new pool.
 
 ```rust,no_run
 # use latzero::Client;
@@ -143,6 +145,53 @@ client.switch_pool("another-pool", None).await?;
 
 Call `disconnect` for an orderly pool leave. Dropping the final clone of a
 `Client` still closes its transport if explicit disconnection is not possible.
+
+## Local Pod Mode
+
+Pod mode is an explicit server option, such as `latzero-server --headless --pods 4`;
+the ordinary single-daemon mode remains compatible with older clients. **Release
+note:** `--pods N` requires a new Rust SDK revision containing `pool_redirect_v1`,
+not an older build that only understands membership ACKs. This change leaves the
+crate version and locked dependencies unchanged; use this checkout until a
+redirect-aware release is available. Older clients receive the server's
+`redirect_required` error and owner endpoint information instead of joining the
+wrong pod.
+
+The SDK advertises `hello.payload.capabilities = ["pool_redirect_v1"]`. Only a
+redirect correlated with the pending `join_pool` or `switch_pool` is followed.
+Each owner connection repeats HELLO and JOIN with the same client ID, requested
+pool, and supplied pool token. The pool name is accepted only after the final
+owner's ACK. TCP connection, HELLO, JOIN, admission, and handoff all share the
+original connect or switch deadline; a hop does not restart the timeout.
+
+`ClientBuilder::max_redirects(usize)` defaults to **4** and accepts **0 through
+16**, counted separately for each connect or explicit switch. Zero rejects
+redirects rather than following them. Revisited endpoints, malformed protocol,
+client/pool mismatches, nonzero-u16 port violations, and invalid pod index/count
+are `Error::Protocol`. A chain's cluster and pod count must remain consistent;
+these are ownership metadata, not authentication. The final owner still checks
+the pool token, and denial remains `Error::Authentication`.
+
+Redirects are deliberately **local only**. The initially configured host must be
+numeric loopback or `localhost`; every redirect target and router address must
+be numeric loopback. A remote hostname is not trusted just because it resolves
+to loopback. The client and pods must share the same host/network namespace,
+and local firewall rules must allow both the public router TCP port and the
+per-pod owner TCP ports, which may be allocated dynamically. This TCP SDK does
+not use the optional WebSocket ports or follow router metadata as a fallback.
+The configured entry host/port remain stable; the active owner endpoint is
+separate internal transport state.
+
+A successful switch updates the existing shared client state: all `Client`
+clones, namespaces, and existing event receivers observe the new pool. Old-pool
+handlers, pending routes, and queued frames are fenced and quiesced before a
+replacement transport is attached. A same-pool rejoin ACK on the owner keeps
+registered processes and pending routes. An actual transport replacement clears
+process registrations and pending routes even if the pool name is unchanged.
+Register processes and subscribe again explicitly when needed. Failed or
+cancelled redirect handoff closes every clone because membership is uncertain.
+There is no automatic reconnect, RPC/effect retry, or replay of registrations,
+subscriptions, or unregister requests.
 
 ## Buffers
 
@@ -563,7 +612,8 @@ list_processes, worker_metrics
 Older server executables may not support every operation. If the server returns
 `Unsupported message type`, upgrade the server or avoid that newer operation.
 
-The protocol currently does not provide version negotiation, TLS,
+Apart from the local pool-redirect capability, the protocol provides no general
+version negotiation, TLS,
 reconnection, or resumable sessions. A closed connection fails pending
 requests. Create a new `Client` and re-register event handlers and processes to
 reconnect.
@@ -590,6 +640,7 @@ These builder settings are protective limits, not throughput guarantees:
 | `max_handler_tasks` / `max_handler_bytes` | 256 / 1 MiB |
 | `max_batch_size` | 256 |
 | `event_capacity` | 256 |
+| `max_redirects` | 4 (allowed range 0..16) |
 
 ```rust,no_run
 use latzero::Client;
@@ -615,7 +666,7 @@ include encoded input plus metadata. They do not bound temporary serialization
 allocations, decoded-object overhead, or memory allocated by user code. Pending
 reply slots admit at most one acceptance ACK and one terminal response.
 
-One deadline covers TCP connect, hello, and join. Requests use one deadline for
+One deadline covers TCP connect, hello, join, and all redirect hops. Requests use one deadline for
 local admission, sending, and terminal completion; pool transitions reject new
 regular work explicitly. An expired or cancelled request still queued before
 transmission is skipped, not replayed. Once a write starts, timeout/cancellation
@@ -623,7 +674,7 @@ cannot guarantee that remote handler effects did not occur.
 
 Handlers and transport tasks are tracked. Disconnect, EOF, last-public-handle
 drop, and changed-pool switches cancel admitted async work and fence late replies
-to its original pool/session generation. Same-pool rejoin retains handlers and
+to its original pool/session generation. Same-owner, same-pool rejoin retains handlers and
 registrations. Process replacement prepares the new handler before advertising
 it, restores the prior handler on a definitive server rejection, and quiesces
 old work on replacement/unregister. Ambiguous registration or membership
@@ -697,6 +748,13 @@ bounded and reaped separately from the daemon fixture.
 The Rust 1.85 minimum is unchanged and tested with the locked dependency set.
 Browser-engine, other-OS, and long-running load verification remain separate
 gates, not passing results implied by these tests.
+
+After the single-daemon suite, set `LATZERO_TEST_PODS=1` and run
+`cargo test --test daemon_interop real_pods --locked -- --nocapture` to exercise
+an isolated four-pod supervisor, cross-owner switches, clone/event visibility,
+Rust/Python RPC, and owner authentication denial. It uses ephemeral TCP ports,
+disabled WebSockets, and a unique directory under the existing temporary `kilo`
+parent; all children are stopped before snapshot removal.
 
 ## License
 

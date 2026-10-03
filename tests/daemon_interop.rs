@@ -24,11 +24,17 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pods_router_affinity_cross_owner_switch_and_same_owner_rejoin() {
-    let Some(mut daemon) = Daemon::start_pods().await else { return; };
+    let Some(mut daemon) = Daemon::start_pods().await else {
+        return;
+    };
     assert_eq!(daemon.ready["pod_count"], 4);
     assert_eq!(daemon.ready["children"].as_array().unwrap().len(), 4);
-    let pids: HashSet<_> = daemon.ready["children"].as_array().unwrap()
-        .iter().map(|child| child["pid"].as_u64().unwrap()).collect();
+    let pids: HashSet<_> = daemon.ready["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|child| child["pid"].as_u64().unwrap())
+        .collect();
     assert_eq!(pids.len(), 4);
     assert!(!pids.contains(&daemon.ready["pid"].as_u64().unwrap()));
     assert_ne!(daemon.ready["initial_owner"], daemon.ready["other_owner"]);
@@ -36,16 +42,40 @@ async fn real_pods_router_affinity_cross_owner_switch_and_same_owner_rejoin() {
     let source = daemon.client("rust-pod-source").await;
     let clone = source.clone();
     let target = daemon.client("rust-pod-target").await;
-    target.on_event("echo", |data| async move { Ok::<_, String>(data["value"].clone()) }).await;
-    source.register_process("retained", ProcessOptions::default(), |_| async {
-        Ok::<_, String>("same-owner")
-    }).await.unwrap();
+    target
+        .on_event("echo", |data| async move {
+            Ok::<_, String>(data["value"].clone())
+        })
+        .await;
+    source
+        .register_process("retained", ProcessOptions::default(), |_| async {
+            Ok::<_, String>("same-owner")
+        })
+        .await
+        .unwrap();
     let value = json!({"nested": [1, null, false, {"pod": "owner"}]});
     source.set("isolation", &value).await.unwrap();
-    assert_eq!(source.call_app::<_, Value>("rust-pod-target", "echo", &json!({"value": value})).await.unwrap(), value);
-    let raw = daemon.command("start_raw", json!({"pool": POOL, "client_id": "raw-pod-peer"})).await;
+    assert_eq!(
+        source
+            .call_app::<_, Value>("rust-pod-target", "echo", &json!({"value": value}))
+            .await
+            .unwrap(),
+        value
+    );
+    let raw = daemon
+        .command(
+            "start_raw",
+            json!({"pool": POOL, "client_id": "raw-pod-peer"}),
+        )
+        .await;
     assert_eq!(raw["client_id"], "raw-pod-peer");
-    assert_eq!(source.call_process::<_, Value>("raw-pod-peer:echo", &json!({"value": value})).await.unwrap(), value);
+    assert_eq!(
+        source
+            .call_process::<_, Value>("raw-pod-peer:echo", &json!({"value": value}))
+            .await
+            .unwrap(),
+        value
+    );
     let invocation = daemon.command("next_raw_call", json!({})).await;
     assert_eq!(invocation["invocation"]["pool"], POOL);
     let mut events = clone.events();
@@ -54,24 +84,46 @@ async fn real_pods_router_affinity_cross_owner_switch_and_same_owner_rejoin() {
     assert_eq!(clone.pool_name().await, other_pool);
     assert_eq!(clone.get::<Value>("isolation").await.unwrap(), None);
     clone.subscribe_buffer("changed-pool").await.unwrap();
-    clone.set("changed-pool", &json!({"clone": true})).await.unwrap();
+    clone
+        .set("changed-pool", &json!({"clone": true}))
+        .await
+        .unwrap();
     let update = bounded(async {
         for _ in 0..64 {
             if let ClientEvent::Buffer(update) = events.recv().await.unwrap() {
-                if update.key == "changed-pool" { return update; }
+                if update.key == "changed-pool" {
+                    return update;
+                }
             }
         }
         panic!("new pool buffer event did not reach the original event subscription");
-    }).await;
+    })
+    .await;
     assert_eq!(update.entry.value, json!({"clone": true}));
     clone.switch_pool(POOL, None).await.unwrap();
     assert_eq!(source.pool_name().await, POOL);
-    assert_eq!(clone.get::<Value>("isolation").await.unwrap(), Some(value.clone()));
-    assert!(matches!(target.call_process::<_, Value>("rust-pod-source:retained", &json!({})).await,
-        Err(Error::Server { code, .. }) if code == "process_not_found"));
-    source.register_process("retained", ProcessOptions::default(), |_| async { Ok::<_, String>("same-owner") }).await.unwrap();
+    assert_eq!(
+        clone.get::<Value>("isolation").await.unwrap(),
+        Some(value.clone())
+    );
+    assert!(
+        matches!(target.call_process::<_, Value>("rust-pod-source:retained", &json!({})).await,
+        Err(Error::Server { code, .. }) if code == "process_not_found")
+    );
+    source
+        .register_process("retained", ProcessOptions::default(), |_| async {
+            Ok::<_, String>("same-owner")
+        })
+        .await
+        .unwrap();
     source.switch_pool(POOL, None).await.unwrap();
-    assert_eq!(target.call_process::<_, String>("rust-pod-source:retained", &json!({})).await.unwrap(), "same-owner");
+    assert_eq!(
+        target
+            .call_process::<_, String>("rust-pod-source:retained", &json!({}))
+            .await
+            .unwrap(),
+        "same-owner"
+    );
     source.disconnect().await.unwrap();
     assert!(!clone.is_connected());
     target.disconnect().await.unwrap();
@@ -81,7 +133,9 @@ async fn real_pods_router_affinity_cross_owner_switch_and_same_owner_rejoin() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pods_python_bidirectional_rpc_and_auth_denial_after_redirect() {
-    let Some(mut daemon) = Daemon::start_pods().await else { return; };
+    let Some(mut daemon) = Daemon::start_pods().await else {
+        return;
+    };
     let python = daemon.command("start_python", json!({"pool": POOL})).await;
     if let Some(reason) = python.get("skip").and_then(Value::as_str) {
         eprintln!("SKIP real-pod Python SDK: {reason}");
@@ -90,27 +144,58 @@ async fn real_pods_python_bidirectional_rpc_and_auth_denial_after_redirect() {
     }
     assert_eq!(python["client_id"], "python-peer");
     let rust = daemon.client("rust-pod-worker").await;
-    rust.on_event("echo", |data| async move { Ok::<_, String>(data["value"].clone()) }).await;
-    rust.register_process("echo", ProcessOptions::default(), |data| async move { Ok::<_, String>(data["value"].clone()) }).await.unwrap();
+    rust.on_event("echo", |data| async move {
+        Ok::<_, String>(data["value"].clone())
+    })
+    .await;
+    rust.register_process("echo", ProcessOptions::default(), |data| async move {
+        Ok::<_, String>(data["value"].clone())
+    })
+    .await
+    .unwrap();
     let value = json!({"list": [null, true, 1, 2.5], "string": "owner-affine"});
     for kind in ["app", "process"] {
         let reply = if kind == "app" {
-            rust.call_app::<_, Value>("python-peer", "echo", &json!({"value": value})).await.unwrap()
+            rust.call_app::<_, Value>("python-peer", "echo", &json!({"value": value}))
+                .await
+                .unwrap()
         } else {
-            rust.call_process::<_, Value>("python-peer:echo", &json!({"value": value})).await.unwrap()
+            rust.call_process::<_, Value>("python-peer:echo", &json!({"value": value}))
+                .await
+                .unwrap()
         };
-        assert_eq!(reply, json!({"owner": "python-peer", "kind": kind, "value": value}));
-        let returned = daemon.command("python_call", json!({"kind": kind, "target": "rust-pod-worker", "value": value})).await;
+        assert_eq!(
+            reply,
+            json!({"owner": "python-peer", "kind": kind, "value": value})
+        );
+        let returned = daemon
+            .command(
+                "python_call",
+                json!({"kind": kind, "target": "rust-pod-worker", "value": value}),
+            )
+            .await;
         assert_eq!(returned, value);
     }
     let other_pool = daemon.ready["other_pool"].as_str().unwrap();
-    let owner = Client::builder("latzero://secure-owner", other_pool).port(daemon.port)
-        .auth_token("owner-secret").timeout(Duration::from_secs(5)).connect().await.unwrap();
-    let denied = Client::builder("latzero://denied", other_pool).port(daemon.port)
-        .auth_token("wrong").timeout(Duration::from_secs(5)).connect().await;
+    let owner = Client::builder("latzero://secure-owner", other_pool)
+        .port(daemon.port)
+        .auth_token("owner-secret")
+        .timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .unwrap();
+    let denied = Client::builder("latzero://denied", other_pool)
+        .port(daemon.port)
+        .auth_token("wrong")
+        .timeout(Duration::from_secs(5))
+        .connect()
+        .await;
     assert!(matches!(denied, Err(Error::Authentication(_))));
     let clone = rust.clone();
-    assert!(matches!(rust.switch_pool(other_pool, Some("wrong")).await, Err(Error::Authentication(_))));
+    assert!(matches!(
+        rust.switch_pool(other_pool, Some("wrong")).await,
+        Err(Error::Authentication(_))
+    ));
     assert!(!rust.is_connected() && !clone.is_connected());
     assert_eq!(clone.pool_name().await, POOL);
     owner.disconnect().await.unwrap();
