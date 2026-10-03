@@ -588,6 +588,30 @@ async fn rpc_and_unsolicited_redirects_never_replay_or_replace_transport() {
 }
 
 #[tokio::test]
+async fn definitive_membership_ack_cannot_be_replaced_by_late_duplicate_redirect() {
+    let (client, mut peer) = pair(|builder| builder).await;
+    let owner = listener().await;
+    let port = owner.local_addr().unwrap().port();
+    let mut events = client.events();
+    let mut switch = Box::pin(client.switch_pool("beta", None));
+    let request = request_for(&mut peer, &mut switch).await;
+    // Keep the switch unpolled until the reader consumes all three frames.
+    // Its ACK is definitive even though its pending slot has not dropped yet.
+    peer.reply(&request, "ack", json!({"pool": "beta"})).await;
+    peer.send(&redirect(&request, port, "beta")).await;
+    peer.send(&presence("beta", "duplicate-fenced")).await;
+    assert!(
+        matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "duplicate-fenced")
+    );
+    bounded(switch).await.unwrap();
+    assert!(client.is_connected());
+    assert_eq!(client.pool_name().await, "beta");
+    let mut accept = Box::pin(owner.accept());
+    poll_pending(accept.as_mut()).await;
+    finish(client, peer).await;
+}
+
+#[tokio::test]
 async fn redirect_hops_share_the_original_connect_deadline() {
     let router = listener().await;
     let owner = listener().await;

@@ -842,6 +842,9 @@ async fn handshake_request(
             resource: "writer bytes",
         });
     }
+    if Instant::now() >= options.deadline {
+        return Err(request_timeout(request_id, options.timeout));
+    }
     let write_deadline = options.deadline.min(deadline(options.write_timeout)?);
     time::timeout_at(write_deadline.into(), writer.write_all(&encoded))
         .await
@@ -2560,6 +2563,7 @@ async fn read_loop(
                     if !duplicate {
                         if reply == "ack" {
                             slot.acknowledgement = true;
+                            slot.terminal = !is_rpc;
                             if let Some((pool, auth_token)) = slot.membership.take() {
                                 let changed = pool != *lock(&state.pool);
                                 *lock(&state.pool) = pool;
