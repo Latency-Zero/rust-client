@@ -6,6 +6,7 @@ import importlib
 import importlib.machinery
 import json
 import math
+import os
 import queue
 import sys
 import tempfile
@@ -125,17 +126,20 @@ class RawWorker:
 
 
 class Fixture:
-    def __init__(self, server, port, root, clock):
+    def __init__(self, server, port, root, clock, pods=False):
         self.server = server
         self.port = port
         self.root = root
         self.clock = clock
+        self.pods = pods
         self.raw = None
         self.python = None
         self.python_hooks = queue.Queue(maxsize=32)
         self.python_updates = queue.Queue(maxsize=32)
 
     def stats(self):
+        if self.pods:
+            return self.server.get_dashboard_snapshot()
         return {"routes": self.server._route_count,
                 "clients": {name: sorted(pool.clients) for name, pool in self.server._pools.items()},
                 "processes": {name: sorted(pool.processes) for name, pool in self.server._pools.items()}}
@@ -143,7 +147,8 @@ class Fixture:
     async def command(self, command):
         operation = command["operation"]
         if operation == "barrier":
-            await asyncio.wait_for(self.server._worker_pool.join(), 5)
+            if not self.pods:
+                await asyncio.wait_for(self.server._worker_pool.join(), 5)
             return self.stats()
         if operation == "advance_clock":
             if self.clock is None:
@@ -154,7 +159,10 @@ class Fixture:
         if operation == "start_raw":
             if self.raw is not None:
                 raise ValueError("Only one raw fixture worker is allowed")
-            self.raw = await RawWorker.connect(self.port, command["pool"], command["client_id"])
+            port = self.port
+            if self.pods:
+                port = self.server.children[self.server.pool_owner(command["pool"])].port
+            self.raw = await RawWorker.connect(port, command["pool"], command["client_id"])
             return {"client_id": self.raw.client_id}
         if operation == "next_raw_call":
             return await asyncio.wait_for(self.raw.calls.get(), 5)
@@ -237,12 +245,30 @@ async def run(options, server_class, config_class, server_module):
         clock = Clock() if options.controlled_clock else None
         if clock is not None:
             server_module.time = clock
-        server = server_class(config_class(port=0, websocket_enabled=False, data_dir=data_dir,
-                                           min_workers=2, max_workers=4, shutdown_timeout=3))
-        fixture = Fixture(server, 0, Path(options.server_root).parent, clock)
-        await asyncio.wait_for(server.start(), 5)
-        fixture.port = server._tcp_server.sockets[0].getsockname()[1]
-        emit({"ok": True, "ready": True, "port": fixture.port, "data_dir": str(data_dir)})
+        config = config_class(port=0, websocket_enabled=False, data_dir=data_dir,
+                              min_workers=2, max_workers=4, shutdown_timeout=3)
+        if options.pods > 1:
+            supervisor = importlib.import_module("latzero_server.pods").PodSupervisor
+            server = supervisor(config, options.pods, startup_timeout=15)
+        else:
+            server = server_class(config)
+        fixture = Fixture(server, 0, Path(options.server_root).parent, clock, options.pods > 1)
+        await asyncio.wait_for(server.start(), 20 if fixture.pods else 5)
+        fixture.port = server.tcp_port if fixture.pods else server._tcp_server.sockets[0].getsockname()[1]
+        ready = {"ok": True, "ready": True, "port": fixture.port,
+                 "pid": os.getpid(), "data_dir": str(data_dir)}
+        if fixture.pods:
+            initial_pool = "rust-daemon-interop"
+            other_pool = next("integration-other-%d" % index for index in range(1000)
+                              if server.pool_owner("integration-other-%d" % index)
+                              != server.pool_owner(initial_pool))
+            ready.update({"pod_count": options.pods, "initial_pool": initial_pool,
+                          "other_pool": other_pool,
+                          "initial_owner": server.pool_owner(initial_pool),
+                          "other_owner": server.pool_owner(other_pool),
+                          "children": [{"pid": child.pid, "index": child.index,
+                                        "port": child.port} for child in server.children]})
+        emit(ready)
         while True:
             line = await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
             if not line:
@@ -269,7 +295,10 @@ def main():
     parser.add_argument("--server-root", required=True)
     parser.add_argument("--temp-root", required=True)
     parser.add_argument("--controlled-clock", action="store_true")
+    parser.add_argument("--pods", type=int, choices=(1, 4), default=1)
     options = parser.parse_args()
+    if options.pods > 1 and options.controlled_clock:
+        parser.error("Controlled fixture clocks are only available for the single daemon")
     sys.path.insert(0, options.server_root)
     try:
         server_module = importlib.import_module("latzero_server.server")
