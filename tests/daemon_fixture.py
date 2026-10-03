@@ -8,6 +8,7 @@ import json
 import math
 import os
 import queue
+import shutil
 import sys
 import tempfile
 import time
@@ -222,7 +223,7 @@ class Fixture:
     async def close(self):
         errors = []
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 6
+        deadline = loop.time() + (28 if self.pods else 6)
         for action in (self.raw.close if self.raw is not None else None,
                        partial(blocking, self.python.disconnect) if self.python is not None else None,
                        self.server.stop):
@@ -237,8 +238,7 @@ class Fixture:
 
 
 async def run(options, server_class, config_class, server_module):
-    temporary = tempfile.TemporaryDirectory(prefix="state-", dir=options.temp_root)
-    data_dir = Path(temporary.name)
+    data_dir = Path(tempfile.mkdtemp(prefix="state-", dir=options.temp_root))
     fixture = None
     shutdown_id = None
     try:
@@ -280,11 +280,11 @@ async def run(options, server_class, config_class, server_module):
             result = await asyncio.wait_for(fixture.command(command), 8)
             emit({"ok": True, "id": command["id"], "result": result})
     finally:
-        try:
-            if fixture is not None:
-                await fixture.close()
-        finally:
-            temporary.cleanup()
+        if fixture is not None:
+            await fixture.close()
+        # Failed shutdown leaves owned state intact rather than deleting files
+        # that a live runtime may still be flushing or locking.
+        shutil.rmtree(data_dir)
     if shutdown_id is not None:
         emit({"ok": True, "id": shutdown_id,
               "result": {"stopped": True, "data_removed": not data_dir.exists()}})

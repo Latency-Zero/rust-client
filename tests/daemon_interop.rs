@@ -214,6 +214,7 @@ struct FixtureProcess {
     output: mpsc::Receiver<std::io::Result<String>>,
     reader: Option<JoinHandle<()>>,
     sequence: u64,
+    response_timeout: Duration,
 }
 
 impl FixtureProcess {
@@ -232,6 +233,7 @@ impl FixtureProcess {
             output,
             reader: None,
             sequence: 0,
+            response_timeout: DEADLINE,
         };
         process.reader = Some(std::thread::Builder::new().spawn(move || {
             for line in StdBufReader::new(stdout).lines() {
@@ -244,8 +246,9 @@ impl FixtureProcess {
     }
 
     async fn receive(&mut self) -> Value {
-        let line = bounded(self.output.recv())
+        let line = time::timeout(self.response_timeout, self.output.recv())
             .await
+            .expect("fixture response exceeded its finite deadline")
             .expect("fixture child exited before its JSON response")
             .expect("fixture child stdout failed");
         let message: Value = serde_json::from_str(&line).expect("fixture output was not JSON");
@@ -366,7 +369,7 @@ impl Daemon {
         if pods > 1 {
             command.arg("--pods").arg(pods.to_string());
         }
-        let process = match FixtureProcess::spawn(command) {
+        let mut process = match FixtureProcess::spawn(command) {
             Ok(process) => process,
             Err(error) => {
                 std::fs::remove_dir_all(&temp_root).unwrap();
@@ -374,6 +377,9 @@ impl Daemon {
                 return None;
             }
         };
+        if pods > 1 {
+            process.response_timeout = Duration::from_secs(32);
+        }
         let mut daemon = Self {
             process,
             temp_root,
