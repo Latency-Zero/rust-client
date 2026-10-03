@@ -242,6 +242,29 @@ async fn router_owner_handshake_preserves_identity_auth_and_final_buffered_push(
     finish(client, owner).await;
 }
 
+#[tokio::test]
+async fn final_join_ack_and_following_push_in_one_write_keep_buffered_input() {
+    let owner = listener().await;
+    let port = owner.local_addr().unwrap().port();
+    let (client, peer) = bounded(async {
+        tokio::join!(builder(port).connect(), async {
+            let mut peer = Peer::accept(&owner).await;
+            peer.hello().await;
+            let join = peer.membership(POOL, None).await;
+            let mut bytes = serde_json::to_vec(&response(&join, "ack", json!({"pool": POOL}))).unwrap();
+            bytes.push(b'\n');
+            bytes.extend(serde_json::to_vec(&presence(POOL, "buffered-after-join")).unwrap());
+            bytes.push(b'\n');
+            bounded(peer.writer.write_all(&bytes)).await.unwrap();
+            peer
+        })
+    }).await;
+    let client = client.unwrap();
+    let mut events = client.events();
+    assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Presence(value) if value.client_id == "buffered-after-join"));
+    finish(client, peer).await;
+}
+
 async fn hop_chain(redirects: usize, limit: Option<usize>) {
     let mut listeners = Vec::new();
     for _ in 0..=redirects { listeners.push(listener().await); }
@@ -473,6 +496,61 @@ async fn redirect_hops_share_the_original_connect_deadline() {
     assert!(matches!(result, Err(Error::Timeout { .. })));
     first.closed().await;
     target.closed().await;
+}
+
+#[tokio::test]
+async fn switch_handoff_hello_join_share_the_original_switch_deadline() {
+    let (client, mut old) = pair(|builder| builder.timeout(Duration::from_millis(700))).await;
+    let owner = listener().await;
+    let port = owner.local_addr().unwrap().port();
+    let started = time::Instant::now();
+    let mut switch = Box::pin(client.switch_pool("beta", None));
+    let request = request_for(&mut old, &mut switch).await;
+    assert!(time::timeout_at(started + Duration::from_millis(450), switch.as_mut()).await.is_err());
+    old.send(&redirect(&request, port, "beta")).await;
+    let mut target = bounded(async {
+        tokio::select! {
+            _ = switch.as_mut() => panic!("switch ended before owner"),
+            peer = Peer::accept(&owner) => peer,
+        }
+    }).await;
+    let hello = request_for(&mut target, &mut switch).await;
+    target.reply(&hello, "ack", json!({})).await;
+    let join = request_for(&mut target, &mut switch).await;
+    assert_eq!(join.kind, "join_pool");
+    let result = time::timeout_at(started + Duration::from_millis(950), switch).await.expect("switch reset the redirect deadline");
+    assert!(matches!(result, Err(Error::Timeout { .. })));
+    assert!(!client.is_connected());
+    old.closed().await;
+    target.closed().await;
+}
+
+#[tokio::test]
+async fn rejected_switch_redirect_closes_uncertain_old_membership_without_target_connect() {
+    for invalid in ["disabled", "zero-port", "cycle", "wrong-pool"] {
+        let (client, mut old) = pair(|builder| builder.max_redirects(if invalid == "disabled" { 0 } else { 4 })).await;
+        let clone = client.clone();
+        let owner = listener().await;
+        let owner_port = owner.local_addr().unwrap().port();
+        let mut events = clone.events();
+        let mut switch = Box::pin(client.switch_pool("beta", None));
+        let request = request_for(&mut old, &mut switch).await;
+        let mut redirect = redirect(&request, owner_port, "beta");
+        match invalid {
+            "zero-port" => redirect.payload["port"] = json!(0),
+            "cycle" => redirect.payload["port"] = json!(old.writer.local_addr().unwrap().port()),
+            "wrong-pool" => redirect.payload["pool"] = json!("other"),
+            _ => {}
+        }
+        old.send(&redirect).await;
+        assert!(matches!(bounded(switch).await, Err(Error::Protocol(_))));
+        assert!(!client.is_connected() && !clone.is_connected());
+        assert_eq!(clone.pool_name().await, POOL);
+        assert!(matches!(bounded(events.recv()).await.unwrap(), ClientEvent::Disconnected));
+        old.closed().await;
+        let mut accept = Box::pin(owner.accept());
+        poll_pending(accept.as_mut()).await;
+    }
 }
 
 struct Dropped(mpsc::UnboundedSender<()>);

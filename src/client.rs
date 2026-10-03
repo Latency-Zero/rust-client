@@ -3233,6 +3233,7 @@ mod tests {
         let client = client.unwrap();
         let original_inner = Arc::clone(&client.inner);
         let old_generation = client.inner.connection_generation.load(Ordering::Acquire);
+        let old_work_generation = client.inner.generation.load(Ordering::Acquire);
         let metrics_id = lock(&client.inner.metrics_task).as_ref().unwrap().id();
         let switched = async {
             client.switch_pool("beta", Some("token")).await.unwrap();
@@ -3244,6 +3245,8 @@ mod tests {
             assert_eq!(client.inner.queued_bytes.load(Ordering::Acquire), 0);
             assert_eq!(client.inner.handler_bytes.load(Ordering::Acquire), 0);
             client.inner.close_connection(old_generation);
+            assert!(client.is_connected());
+            client.reply_call("obsolete-hop".to_owned(), "old-event", Ok(json!(42)), old_work_generation, "alpha".to_owned());
             assert!(client.is_connected());
             client.clients().await.unwrap();
             client.force_close().await;
@@ -3267,9 +3270,10 @@ mod tests {
             let (socket, _) = owner.accept().await.unwrap();
             let (reader, mut writer) = socket.into_split();
             let mut reader = BufReader::new(reader);
-            for _ in 0..3 {
+            for expected in ["hello", "join_pool", "list_clients"] {
                 let frame = read_frame(&mut reader, 4096).await.unwrap().unwrap();
                 let request: Message = serde_json::from_slice(&frame).unwrap();
+                assert_eq!(request.kind, expected);
                 let ack = Message::new(MessageType::Ack, request.request_id, request.client_id, request.pool, json!({"clients": ["worker"]}));
                 let mut bytes = serde_json::to_vec(&ack).unwrap();
                 bytes.push(b'\n');
